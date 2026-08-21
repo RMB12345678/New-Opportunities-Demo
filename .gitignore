@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+output/*.json
+output/score_cache.json
+output/seen_jobs.json
+.DS_Store
