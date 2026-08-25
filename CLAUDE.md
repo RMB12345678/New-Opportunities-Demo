@@ -42,7 +42,6 @@ python run.py --dry-run        # rehearsal: no writes, no API spend
 python run.py                  # the real thing
 python -m pytest tests/        # the offline checks
 python output_excel.py         # rebuild the workbook from existing output/*.json
-python reset_pe_vc_firms.py    # one-off: clear a marker so those rows get re-researched
 ```
 
 Requires a `.env` in the repo root with `NOTION_API_KEY`, `NOTION_DATABASE_ID`,
