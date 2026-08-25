@@ -12,10 +12,24 @@ import os
 import time
 import requests
 
+from http_client import session
+
 NOTION_API_KEY = os.environ["NOTION_API_KEY"]
 NOTION_DATABASE_ID = os.environ["NOTION_DATABASE_ID"]
 JOB_POSTINGS_DATABASE_ID = os.environ["JOB_POSTINGS_DATABASE_ID"]
 NOTION_VERSION = "2022-06-28"
+
+# Close-pass safety valve. A single run closing more than this fraction of
+# everything currently open is a systemic failure, not real closures.
+CLOSE_VALVE_MAX_FRACTION = 0.25
+
+# ...but a fraction is meaningless on a handful of rows: with 3 open rows,
+# one genuine closure is 33% and would abort, and would keep aborting on
+# every subsequent run, so that row could never close at all. Below this
+# floor the ratio is not applied and closures go through on their own
+# merits. 20 is the point where a single closure (5%) is comfortably
+# inside the limit, so the valve only speaks up about genuine clusters.
+CLOSE_VALVE_MIN_OPEN_ROWS = 20
 
 BASE_URL = "https://api.notion.com/v1"
 HEADERS = {
@@ -52,7 +66,7 @@ def get_all_companies():
     url = f"{BASE_URL}/databases/{NOTION_DATABASE_ID}/query"
 
     while True:
-        resp = requests.post(url, headers=HEADERS, json=payload)
+        resp = session.post(url, headers=HEADERS, json=payload)
         _raise_with_detail(resp)
         data = resp.json()
 
@@ -126,7 +140,8 @@ get_html_companies_missing_url = get_companies_missing_url
 
 
 def update_company_info(page_id, sector=None, hq=None, source=None,
-                          ats_platform=None, scrape_method=None, careers_url=None):
+                          ats_platform=None, scrape_method=None, careers_url=None,
+                          dry_run=False):
     """Write any subset of a company's fields back to its Notion page.
     Only fields passed in (not None) are written — this lets callers
     update just ATS info, just sector/HQ, or everything at once."""
@@ -156,38 +171,51 @@ def update_company_info(page_id, sector=None, hq=None, source=None,
     if not properties:
         return None
 
+    if dry_run:
+        print(f"     [dry-run] would update {page_id}: {list(properties.keys())}")
+        return None
+
     payload = {"properties": properties}
-    resp = requests.patch(url, headers=HEADERS, json=payload)
+    resp = session.patch(url, headers=HEADERS, json=payload)
     _raise_with_detail(resp)
     return resp.json()
 
 
-def update_ats_fields(page_id, ats_platform, scrape_method, careers_url=None):
+def update_ats_fields(page_id, ats_platform, scrape_method, careers_url=None, dry_run=False):
     """Kept for backward compatibility — writes just the ATS-related fields."""
     return update_company_info(
-        page_id, ats_platform=ats_platform, scrape_method=scrape_method, careers_url=careers_url
+        page_id, ats_platform=ats_platform, scrape_method=scrape_method,
+        careers_url=careers_url, dry_run=dry_run
     )
 
 
-def sync_jobs_to_notion(jobs):
+def sync_jobs_to_notion(jobs, scraped_ok, dry_run=False):
     """Write scored jobs to the Job Postings Notion database, deduped by URL.
 
     - New URL -> create a row, First Seen = today, linked to the matching
       Target List company via the Company relation.
     - Known URL -> update Score/Reasoning/Routing/Last Seen on the existing
       row, never duplicate it.
-    - Anything previously in Job Postings that did NOT show up in this
-      run's scrape gets Still Open flipped to false (not deleted — the
-      history stays, it's just marked closed).
+    - A row whose URL did NOT show up in this run's scrape gets Still Open
+      flipped to false (not deleted — the history stays, it's just marked
+      closed), but ONLY when its company is in scraped_ok. See the close
+      pass below for why that qualifier is the entire point.
+
+    scraped_ok comes from run_scrapers() and holds the names of the
+    companies whose scrape actually completed this run.
     """
     from datetime import date
     today = date.today().isoformat()
 
-    existing = _query_all_job_postings()
-    existing_by_url = {row["url"]: row for row in existing if row.get("url")}
-
+    # Target List has to be fetched first now: _query_all_job_postings()
+    # needs this map to resolve each row's Company relation to a name,
+    # which is what the close pass gates on.
     company_pages = _query_all_target_list_pages()
     company_page_by_name = {row["company"]: row["page_id"] for row in company_pages}
+    company_name_by_page_id = {row["page_id"]: row["company"] for row in company_pages}
+
+    existing = _query_all_job_postings(company_name_by_page_id)
+    existing_by_url = {row["url"]: row for row in existing if row.get("url")}
 
     seen_urls_this_run = set()
     created, updated, failed = 0, 0, 0
@@ -226,11 +254,11 @@ def sync_jobs_to_notion(jobs):
 
         try:
             if not is_new_in_notion:
-                _write_with_retry(_update_job_posting, existing_by_url[url]["page_id"], properties)
+                _update_job_posting(existing_by_url[url]["page_id"], properties, dry_run=dry_run)
                 updated += 1
             else:
                 properties["date:First Seen:start"] = today
-                _write_with_retry(_create_job_posting, properties)
+                _create_job_posting(properties, dry_run=dry_run)
                 created += 1
         except Exception as e:
             # A single job's write failing (transient Notion outage, rate
@@ -243,56 +271,161 @@ def sync_jobs_to_notion(jobs):
             failed += 1
             failed_jobs.append({"company": job.get("company"), "title": job.get("title"), "url": url})
 
-    closed = 0
+    # --- Close pass ----------------------------------------------------
+    # Absence from this run only proves a posting is gone if we actually
+    # scraped the company it belongs to. run_scrapers() catches every
+    # scrape exception, so a company that timed out looks identical to a
+    # company with nothing open: zero URLs either way. Closing on that
+    # basis marked live jobs closed permanently — the next successful run
+    # found their URLs already in Notion, took the update branch instead
+    # of re-creating them, and left New This Run off, so they never came
+    # back to the active views. Classify first and execute second, so the
+    # safety valve below can veto the whole pass before any write goes out.
+    to_close = []
+    left_open_failed = []
+    left_open_unresolved = []
+
     for row in existing:
-        if row.get("url") and row["url"] not in seen_urls_this_run and row.get("still_open"):
+        if not row.get("url") or row["url"] in seen_urls_this_run or not row.get("still_open"):
+            continue
+        company = row.get("company")
+        if company is None:
+            # No Company relation at all, or one pointing at a Target List
+            # page that no longer exists. Unknown provenance: we cannot
+            # confirm this company's scrape succeeded, and defaulting to
+            # close on an unconfirmed answer is the original bug. Tracked
+            # apart from the failed-scrape bucket because it signals a data
+            # problem (an orphaned row) rather than a transient network
+            # one, and so wants a human rather than just another run.
+            left_open_unresolved.append(row)
+        elif company in scraped_ok:
+            to_close.append(row)
+        else:
+            left_open_failed.append(row)
+
+    if dry_run:
+        _print_close_candidates(to_close, left_open_failed, left_open_unresolved)
+
+    # Safety valve. One run closing more than a quarter of everything open
+    # is a systemic failure — a bad token, a Notion outage, a whole
+    # scraper tier broken — not forty roles that all happened to be filled
+    # on the same Tuesday. Abort the ENTIRE pass rather than closing a
+    # "safe" subset: a partial close still corrupts the dashboard, just
+    # more quietly, and nothing here can tell which fraction was real.
+    #
+    # The floor matters as much as the ratio. On a nearly-empty database
+    # every real closure is a large fraction of the total, so without the
+    # floor the valve would latch shut and never let anything close again.
+    open_count = sum(1 for row in existing if row.get("still_open"))
+    limit = open_count * CLOSE_VALVE_MAX_FRACTION
+    pct = (100.0 * len(to_close) / open_count) if open_count else 0.0
+    over_ratio = bool(open_count) and len(to_close) > limit
+    close_aborted = over_ratio and open_count >= CLOSE_VALVE_MIN_OPEN_ROWS
+
+    if close_aborted:
+        print(f"     [ABORT] close pass aborted by the safety valve: this run would "
+              f"close {len(to_close)} of {open_count} currently-open row(s) = "
+              f"{pct:.1f}%, over the "
+              f"{CLOSE_VALVE_MAX_FRACTION:.0%} limit ({limit:.1f} row(s)).")
+        print("     [ABORT] that is a systemic failure, not real closures — NO rows "
+              "were closed. Everything stays open and the next run will retry.")
+    elif over_ratio:
+        # Loud enough to notice, but explicitly NOT an abort — this is the
+        # spurious case the floor exists to wave through, and the log should
+        # say so rather than leaving a reader to work out why no abort fired.
+        print(f"     [valve] {len(to_close)} of {open_count} open row(s) = {pct:.1f}%, "
+              f"over the {CLOSE_VALVE_MAX_FRACTION:.0%} limit — but only {open_count} "
+              f"row(s) are open, under the {CLOSE_VALVE_MIN_OPEN_ROWS}-row floor, so "
+              f"the ratio does not apply. Closing normally.")
+
+    closed = 0
+    if not close_aborted:
+        for row in to_close:
             try:
                 # Also reset New This Run to false — a job that closes while
                 # still flagged "new" (e.g. it dropped out of scraping before
                 # ever going through a normal update cycle) would otherwise
                 # stay stuck showing as new forever, since nothing ever
                 # touches a closed job again after this point.
-                _write_with_retry(_update_job_posting, row["page_id"],
-                                    {"Still Open": "__NO__", "New This Run": "__NO__"})
+                _update_job_posting(row["page_id"],
+                                     {"Still Open": "__NO__", "New This Run": "__NO__"},
+                                     dry_run=dry_run)
                 closed += 1
             except Exception as e:
                 print(f"     [sync failed] closing {row.get('url')}: {e}")
 
-    return {"created": created, "updated": updated, "closed": closed, "failed": failed, "failed_jobs": failed_jobs}
+    if left_open_failed:
+        failed_companies = {row["company"] for row in left_open_failed}
+        print(f"     {len(left_open_failed)} job(s) from {len(failed_companies)} failed "
+              f"companies left open rather than closed")
+    if left_open_unresolved:
+        print(f"     {len(left_open_unresolved)} job(s) with an unresolved company "
+              f"relation left open — check these manually")
+
+    return {"created": created, "updated": updated, "closed": closed,
+            "failed": failed, "failed_jobs": failed_jobs,
+            "left_open": len(left_open_failed),
+            "left_open_unresolved": len(left_open_unresolved),
+            "close_aborted": close_aborted}
 
 
-def _write_with_retry(fn, *args, max_attempts=3, **kwargs):
-    """Retry a Notion write a couple times with a short backoff before
-    giving up — a 504 gateway timeout or a rate limit is often transient
-    and succeeds on the very next attempt seconds later, so it's worth
-    trying again before treating it as a real failure."""
-    last_error = None
-    for attempt in range(1, max_attempts + 1):
-        try:
-            return fn(*args, **kwargs)
-        except Exception as e:
-            last_error = e
-            if attempt < max_attempts:
-                time.sleep(2 * attempt)  # 2s, then 4s
-    raise last_error
+def _print_close_candidates(to_close, left_open_failed, left_open_unresolved):
+    """Dry-run view of the close pass: every open row whose URL did not turn
+    up this run, and the reason it would or would not be closed. This is the
+    output to eyeball before letting a real run touch Still Open."""
+    total = len(to_close) + len(left_open_failed) + len(left_open_unresolved)
+    if not total:
+        print("     [dry-run] every open row showed up this run — nothing to close")
+        return
+
+    print(f"     [dry-run] close candidates ({total} open row(s) whose URL did not "
+          f"appear this run):")
+    rows = ([(row, "CLOSE     ", "scraped OK") for row in to_close]
+            + [(row, "leave open", "scrape FAILED this run") for row in left_open_failed]
+            + [(row, "leave open", "no/unresolved Company relation")
+               for row in left_open_unresolved])
+    for row, verdict, reason in rows:
+        company = row.get("company") or "(unresolved company)"
+        title = row.get("title") or "(untitled)"
+        print(f"       {verdict} {company[:30]:<30} — {reason:<30} {title[:50]}")
 
 
-def _query_all_job_postings():
+def _query_all_job_postings(company_name_by_page_id=None):
+    """Read every Job Postings row.
+
+    company_name_by_page_id maps Target List page ids to company names;
+    pass it and each row comes back with a resolved "company". The close
+    pass needs to know which company a row belongs to before it can decide
+    whether that company's scrape succeeded, and it matches on the
+    relation's page id rather than on name strings so a company renamed in
+    Notion cannot silently orphan its own postings. Left None, "company"
+    comes back None on every row, which the close pass reads as unknown
+    provenance and never closes.
+
+    The lookup is passed in rather than fetched here because
+    sync_jobs_to_notion() already queries the Target List for the reverse
+    map — re-querying would add a fourth full table scan to a run that
+    already does too many (punch list #12)."""
     rows, cursor = [], None
     while True:
         url = f"{BASE_URL}/databases/{JOB_POSTINGS_DATABASE_ID}/query"
         payload = {"page_size": 100}
         if cursor:
             payload["start_cursor"] = cursor
-        resp = requests.post(url, headers=HEADERS, json=payload)
+        resp = session.post(url, headers=HEADERS, json=payload)
         _raise_with_detail(resp)
         data = resp.json()
         for page in data["results"]:
             props = page["properties"]
+            relation = (props.get("Company") or {}).get("relation") or []
+            company_page_id = relation[0]["id"] if relation else None
             rows.append({
                 "page_id": page["id"],
                 "url": (props.get("URL") or {}).get("url"),
                 "still_open": (props.get("Still Open") or {}).get("checkbox", False),
+                "title": _plain_text(props.get("Job Title")),
+                "company_page_id": company_page_id,
+                "company": (company_name_by_page_id or {}).get(company_page_id),
             })
         if not data.get("has_more"):
             break
@@ -307,7 +440,7 @@ def _query_all_target_list_pages():
         payload = {"page_size": 100}
         if cursor:
             payload["start_cursor"] = cursor
-        resp = requests.post(url, headers=HEADERS, json=payload)
+        resp = session.post(url, headers=HEADERS, json=payload)
         _raise_with_detail(resp)
         data = resp.json()
         for page in data["results"]:
@@ -318,20 +451,29 @@ def _query_all_target_list_pages():
     return rows
 
 
-def _create_job_posting(properties):
+def _create_job_posting(properties, dry_run=False):
+    if dry_run:
+        # Must return before the throttle sleep below — a dry run over
+        # 1,000+ jobs sleeping 0.35s each for a write that never happens
+        # would sit there for minutes doing nothing.
+        return None
     url = f"{BASE_URL}/pages"
     payload = {"parent": {"database_id": JOB_POSTINGS_DATABASE_ID},
                "properties": _build_job_properties(properties)}
-    resp = requests.post(url, headers=HEADERS, json=payload)
+    resp = session.post(url, headers=HEADERS, json=payload)
     _raise_with_detail(resp)
+    time.sleep(0.35)  # stay under Notion's ~3 req/s limit instead of retrying 429s after the fact
     return resp.json()
 
 
-def _update_job_posting(page_id, properties):
+def _update_job_posting(page_id, properties, dry_run=False):
+    if dry_run:
+        return None
     url = f"{BASE_URL}/pages/{page_id}"
     payload = {"properties": _build_job_properties(properties)}
-    resp = requests.patch(url, headers=HEADERS, json=payload)
+    resp = session.patch(url, headers=HEADERS, json=payload)
     _raise_with_detail(resp)
+    time.sleep(0.35)
     return resp.json()
 
 

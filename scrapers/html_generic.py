@@ -17,8 +17,9 @@ can't confidently parse is left for output/skipped_companies.json rather
 than guessing and returning junk.
 """
 import re
-import requests
 from bs4 import BeautifulSoup
+
+from http_client import session
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; MedTechTargetScraper/1.0)"}
 
@@ -53,7 +54,7 @@ def fetch_jobs(company_name, careers_url):
     if not careers_url:
         raise ValueError(f"No careers_url provided for {company_name}")
 
-    resp = requests.get(careers_url, headers=HEADERS, timeout=15)
+    resp = session.get(careers_url, headers=HEADERS, timeout=15)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -77,6 +78,7 @@ def fetch_jobs(company_name, careers_url):
             "location": None,  # generic scraper doesn't reliably find this
             "url": link if link else careers_url,
             "posted_at": None,
+            "description": None,  # generic scraper has no reliable way to find posting text
             "source_ats": "HTML (generic scrape)",
         })
 

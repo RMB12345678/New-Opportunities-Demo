@@ -13,6 +13,10 @@ Requires env var ANTHROPIC_API_KEY for the fallback step.
 import os
 import re
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+from http_client import session
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 
@@ -22,6 +26,24 @@ KNOWN_PATTERNS = [
     ("Lever", "https://api.lever.co/v0/postings/{slug}?mode=json", "API"),
     ("Ashby", "https://api.ashbyhq.com/posting-api/job-board/{slug}", "API"),
 ]
+
+# try_known_patterns() fires up to 3 speculative GETs per company against a
+# GUESSED slug and expects most to 404 — that's the normal case, not a
+# transient failure. The shared `session` above is tuned for calls that are
+# actually likely to succeed (total=5, backoff_factor=1.5); reusing it here
+# would turn a routine 503 on a wrong guess into a ~45s wait, three guesses
+# per company, across the whole target list. This session fails fast
+# instead: one retry, no backoff pileup.
+_guess_retry = Retry(
+    total=1,
+    backoff_factor=1.5,
+    status_forcelist=[429, 500, 502, 503, 504, 529],
+    allowed_methods=["GET"],
+    respect_retry_after_header=True,
+)
+_guess_session = requests.Session()
+_guess_session.mount("https://", HTTPAdapter(max_retries=_guess_retry))
+_guess_session.mount("http://", HTTPAdapter(max_retries=_guess_retry))
 
 
 def slugify(company_name):
@@ -36,7 +58,7 @@ def try_known_patterns(company_name):
     for platform, template, method in KNOWN_PATTERNS:
         url = template.format(slug=slug)
         try:
-            resp = requests.get(url, timeout=6)
+            resp = _guess_session.get(url, timeout=6)
             if resp.status_code == 200 and resp.json():
                 return platform, method
         except requests.RequestException:
@@ -127,7 +149,7 @@ METHOD: <API, HTML, or Manual check>
 URL: <the actual careers/jobs page URL you found, or "N/A" if there's no dedicated careers page>
 HOMEPAGE: <the company's main website URL (e.g. "https://example.com"), or "N/A" if you couldn't find the company at all>"""
 
-    resp = requests.post(
+    resp = session.post(
         "https://api.anthropic.com/v1/messages",
         headers={
             "x-api-key": ANTHROPIC_API_KEY,

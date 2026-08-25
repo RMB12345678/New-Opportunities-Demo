@@ -1,5 +1,5 @@
 """Pulls open job postings from a Greenhouse job board."""
-import requests
+from http_client import session
 
 from ats_finder.find_ats import slugify
 
@@ -7,7 +7,7 @@ from ats_finder.find_ats import slugify
 def fetch_jobs(company_name, slug=None):
     slug = slug or slugify(company_name)
     url = f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true"
-    resp = requests.get(url, timeout=10)
+    resp = session.get(url, timeout=10)
     resp.raise_for_status()
     jobs = resp.json().get("jobs", [])
 
@@ -18,6 +18,7 @@ def fetch_jobs(company_name, slug=None):
             "location": (job.get("location") or {}).get("name"),
             "url": job.get("absolute_url"),
             "posted_at": job.get("updated_at"),
+            "description": job.get("content"),  # HTML-escaped HTML; scoring cleans it
             "source_ats": "Greenhouse",
         }
         for job in jobs

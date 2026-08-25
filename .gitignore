@@ -1,7 +1,12 @@
 .env
 __pycache__/
 *.pyc
-output/*.json
-output/score_cache.json
-output/seen_jobs.json
 .DS_Store
+
+# Everything the pipeline produces. Keep the directory, ignore its contents —
+# this covers jobs.json, score_cache.json, seen_jobs.json, the .xlsx workbook,
+# and any .bak/.log files a run or a cleanup leaves behind. The old rule was
+# output/*.json, which silently tracked the workbook and any backup file whose
+# suffix fell outside .json.
+output/*
+!output/.gitkeep

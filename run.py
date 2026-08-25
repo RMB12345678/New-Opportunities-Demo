@@ -16,7 +16,14 @@ Run order (this is the "check before run" step you asked for):
 
 Usage:
     python run.py
+    python run.py --dry-run   # skip every Notion write and Anthropic call;
+                               # print what the run would have done instead
 """
+import sys
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+import argparse
 import json
 import os
 import re
@@ -44,7 +51,7 @@ SCRAPERS = {
 }
 
 
-def fill_missing_profile_fields():
+def fill_missing_profile_fields(dry_run=False):
     """Catch-up pass: companies that already have an ATS but are still
     missing Sector or HQ (e.g. added before this fix existed, or hit an
     earlier bug where the fast-path skipped research). Looks up a full
@@ -56,10 +63,20 @@ def fill_missing_profile_fields():
     marker for name collisions. Without this, an empty result looks
     identical to "never searched," so the exact same company gets
     re-searched (and re-paid for) on every single future run, forever.
+
+    dry_run=True skips find_via_search (the Anthropic call) entirely —
+    it just lists which companies would have been researched.
     """
     missing = get_companies_missing_profile()
     if not missing:
         print("[check] Every company already has sector/HQ filled in. Continuing.")
+        return
+
+    if dry_run:
+        print(f"[check] [dry-run] {len(missing)} company(ies) missing sector/HQ "
+              f"would be researched via Anthropic:")
+        for row in missing:
+            print(f"  -> {row['company']}")
         return
 
     NOT_FOUND = "Not found (checked, no info located — clear this field to retry)"
@@ -98,7 +115,7 @@ def fill_missing_profile_fields():
         time.sleep(1)
 
 
-def fill_missing_ats():
+def fill_missing_ats(dry_run=False):
     """For any company with a blank ATS Platform (the signal that it's a
     newly added, not-yet-researched company), look up its FULL profile —
     sector, HQ, ATS, careers URL — in one pass and write it all back.
@@ -111,10 +128,20 @@ def fill_missing_ats():
     the industry or HQ to the company name, or fill in HQ yourself — then
     clear ATS Platform back to blank to trigger a fresh, disambiguated
     lookup next run.
+
+    dry_run=True skips find_company_info (the Anthropic call) entirely —
+    it just lists which companies would have been researched.
     """
     missing = get_companies_missing_ats()
     if not missing:
         print("[check] Every company already has an ATS value. Continuing.")
+        return
+
+    if dry_run:
+        print(f"[check] [dry-run] {len(missing)} company(ies) missing ATS data "
+              f"would be researched via Anthropic:")
+        for row in missing:
+            print(f"  -> {row['company']}")
         return
 
     print(f"[check] {len(missing)} company(ies) missing ATS data. Searching now...")
@@ -175,7 +202,7 @@ def google_search_fallback_url(company_name):
     return f"https://www.google.com/search?q={query}"
 
 
-def fill_missing_careers_urls():
+def fill_missing_careers_urls(dry_run=False):
     """Any company missing a saved Careers URL — regardless of whether it's
     API-tier or HTML-scrape — gets one looked up now. This used to only
     check HTML-scrape companies, which silently starved the API scrapers
@@ -187,10 +214,20 @@ def fill_missing_careers_urls():
     real, non-blank URL, so a company is never re-searched (and re-paid
     for) once it's been looked at once — Notion's own "already has a URL"
     check is what prevents that going forward, no separate tracking needed.
+
+    dry_run=True skips find_company_info (the Anthropic call) entirely —
+    it just lists which companies would have been researched.
     """
     missing = get_companies_missing_url()
     if not missing:
         print("[check] Every company already has a Careers URL. Continuing.")
+        return
+
+    if dry_run:
+        print(f"[check] [dry-run] {len(missing)} company(ies) missing a Careers URL "
+              f"would be researched via Anthropic:")
+        for row in missing:
+            print(f"  -> {row['company']}")
         return
 
     print(f"[check] {len(missing)} company(ies) missing a Careers URL. Searching now...")
@@ -293,8 +330,30 @@ def extract_slug(careers_url, platform_name):
 
 
 def run_scrapers(companies):
+    """Scrape every company and return (all_jobs, skipped, scraped_ok).
+
+    scraped_ok is the set of company names whose scraper returned without
+    raising. It exists so sync_jobs_to_notion() can tell "this company's
+    postings are genuinely gone" apart from "we never got a usable answer
+    about this company at all". Without that distinction, a timeout or a
+    transient 500 on one company meant it contributed zero URLs, and the
+    close pass read that silence as proof every one of its roles had been
+    filled. Those rows were then closed permanently: the next successful
+    run found their URLs already in Notion, took the update branch rather
+    than creating them fresh, and left New This Run off — so they never
+    came back into the active views.
+
+    A scrape returning ZERO jobs counts as success. The company was
+    reachable and genuinely has nothing open, so its old rows SHOULD
+    close. Only an exception disqualifies.
+
+    Companies with no matching scraper never enter the set either. They
+    were never attempted, so their postings' absence proves exactly as
+    little as a failure does.
+    """
     all_jobs = []
     skipped = []
+    scraped_ok = set()
 
     for row in companies:
         scraper, matched_name = resolve_scraper(row["ats_platform"])
@@ -306,6 +365,7 @@ def run_scrapers(companies):
                 for job in jobs:
                     job["company_description"] = row.get("sector")
                 all_jobs.extend(jobs)
+                scraped_ok.add(row["company"])
                 slug_note = f", slug from saved URL" if slug else ""
                 print(f"[scrape] {row['company']} (via {matched_name}{slug_note}): {len(jobs)} jobs")
                 continue
@@ -319,6 +379,7 @@ def run_scrapers(companies):
                         for job in jobs:
                             job["company_description"] = row.get("sector")
                         all_jobs.extend(jobs)
+                        scraped_ok.add(row["company"])
                         print(f"[scrape] {row['company']} (via {matched_name}, "
                               f"saved URL failed, guessed slug worked): {len(jobs)} jobs")
                         continue
@@ -343,6 +404,7 @@ def run_scrapers(companies):
                 for job in jobs:
                     job["company_description"] = row.get("sector")
                 all_jobs.extend(jobs)
+                scraped_ok.add(row["company"])
                 print(f"[scrape] {row['company']} (via HTML): {len(jobs)} jobs")
             except Exception as e:
                 print(f"[scrape] {row['company']} (HTML): FAILED ({e})")
@@ -350,39 +412,56 @@ def run_scrapers(companies):
         else:
             skipped.append(row)
 
-    return all_jobs, skipped
+    return all_jobs, skipped, scraped_ok
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Job Search Agent pipeline")
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Skip every Notion write and Anthropic API call; print what would happen instead.",
+    )
+    args = parser.parse_args()
+    dry_run = args.dry_run
+
+    if dry_run:
+        print("=== DRY RUN — no Notion writes or Anthropic calls will be made ===")
+
     print("=== Step 1-2: checking Notion for companies missing ATS data ===")
-    fill_missing_ats()
+    fill_missing_ats(dry_run=dry_run)
 
     print("\n=== Step 2a: backfilling sector/HQ for companies missing it ===")
-    fill_missing_profile_fields()
+    fill_missing_profile_fields(dry_run=dry_run)
 
     print("\n=== Step 2b: checking for HTML-scrape companies missing a Careers URL ===")
-    fill_missing_careers_urls()
+    fill_missing_careers_urls(dry_run=dry_run)
 
     print("\n=== Step 3: re-pulling full company list ===")
     companies = get_all_companies()
     print(f"{len(companies)} total companies")
 
     print("\n=== Step 4-5: scraping API-backed companies ===")
-    jobs, skipped = run_scrapers(companies)
+    jobs, skipped, scraped_ok = run_scrapers(companies)
+    print(f"{len(scraped_ok)} company(ies) scraped successfully; only their postings "
+          f"are eligible to be marked closed below")
 
     print("\n=== Step 6: flagging new postings vs. previous runs ===")
-    jobs = mark_new_postings(jobs)
+    jobs = mark_new_postings(jobs, dry_run=dry_run)
     new_count = sum(1 for j in jobs if j["is_new"])
     print(f"{new_count} new posting(s) since the last run, {len(jobs) - new_count} already seen before")
 
     print("\n=== Step 7: scoring jobs against the rubric ===")
-    jobs = score_all(jobs)
+    jobs = score_all(jobs, dry_run=dry_run)
     print(f"Scored {len(jobs)} jobs")
 
     print("\n=== Step 8: syncing jobs to Notion ===")
-    sync_result = sync_jobs_to_notion(jobs)
-    print(f"Notion: {sync_result['created']} created, {sync_result['updated']} updated, "
+    sync_result = sync_jobs_to_notion(jobs, scraped_ok, dry_run=dry_run)
+    print(f"{'[dry-run] would sync' if dry_run else 'Notion'}: "
+          f"{sync_result['created']} created, {sync_result['updated']} updated, "
           f"{sync_result['closed']} marked closed (no longer posted)")
+    if sync_result.get("close_aborted"):
+        print("[warn] the close pass was aborted by the 25% safety valve — see above. "
+              "Nothing was closed; investigate the scrape failures before the next run.")
     if sync_result.get("failed"):
         print(f"[warn] {sync_result['failed']} job(s) failed to sync after retries "
               f"(likely a transient Notion outage) — they'll be retried automatically next run:")

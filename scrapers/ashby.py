@@ -1,5 +1,5 @@
 """Pulls open job postings from an Ashby job board."""
-import requests
+from http_client import session
 
 from ats_finder.find_ats import slugify
 
@@ -7,7 +7,7 @@ from ats_finder.find_ats import slugify
 def fetch_jobs(company_name, slug=None):
     slug = slug or slugify(company_name)
     url = f"https://api.ashbyhq.com/posting-api/job-board/{slug}"
-    resp = requests.get(url, timeout=10)
+    resp = session.get(url, timeout=10)
     resp.raise_for_status()
     jobs = resp.json().get("jobs", [])
 
@@ -18,6 +18,7 @@ def fetch_jobs(company_name, slug=None):
             "location": job.get("location"),
             "url": job.get("jobUrl"),
             "posted_at": job.get("publishedAt"),
+            "description": job.get("descriptionPlain"),
             "source_ats": "Ashby",
         }
         for job in jobs

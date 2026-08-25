@@ -35,7 +35,7 @@ def _save_seen(seen):
         json.dump(seen, f, indent=2)
 
 
-def mark_new_postings(jobs):
+def mark_new_postings(jobs, dry_run=False):
     """Given this run's scraped jobs, tag each with:
       - is_new: True if this URL has never been seen in any previous run
       - first_seen: the date it was first scraped (today, if new)
@@ -43,7 +43,14 @@ def mark_new_postings(jobs):
     is NOT done here — that's a separate 'still open' concern, handled by
     the fact that jobs.json only ever contains what's currently live.
 
-    Updates and saves the seen-jobs file as a side effect.
+    Updates and saves the seen-jobs file as a side effect, UNLESS dry_run.
+    Recording a URL as seen is a permanent, one-way act: it is what makes a
+    posting stop being new, and nothing ever un-sees it. A dry run that
+    wrote the file consumed exactly the signal it was supposed to be
+    previewing — the next real run found those URLs already recorded and
+    reported them as old. The in-memory is_new tags are still computed and
+    returned either way, so a dry run reports the same counts it would have
+    written; it just does not persist them.
     """
     seen = _load_seen()
     today = date.today().isoformat()
@@ -58,5 +65,10 @@ def mark_new_postings(jobs):
             job["first_seen"] = today
             seen[key] = today
 
-    _save_seen(seen)
+    if dry_run:
+        new_count = sum(1 for job in jobs if job["is_new"])
+        print(f"[new] [dry-run] {new_count} posting(s) would be recorded as first "
+              f"seen today — not written to seen_jobs.json")
+    else:
+        _save_seen(seen)
     return jobs
