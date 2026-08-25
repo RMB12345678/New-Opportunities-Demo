@@ -133,6 +133,18 @@ what it would have done. It still performs read-only Notion queries and
 still scrapes public ATS endpoints, so it is a rehearsal, not an offline
 mode.
 
+### `output/` ships empty on purpose
+
+A fresh clone has an empty `output/` holding only a `.gitkeep`, and that is
+the intended state — nothing is missing. Everything the pipeline writes lands
+there and none of it is committed: `jobs.json` and `skipped_companies.json`
+from the scrape, `score_cache.json` (the scores already paid for),
+`seen_jobs.json` (run history), and the generated `.xlsx` workbook. The
+directory fills itself on your first run.
+
+That also means `python output_excel.py` has nothing to rebuild from until
+you have run the pipeline at least once.
+
 ## Notion setup
 
 You'll need two Notion databases:

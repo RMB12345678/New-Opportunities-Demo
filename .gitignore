@@ -1,6 +1,7 @@
 .env
 __pycache__/
 *.pyc
+.pytest_cache/
 .DS_Store
 
 # Everything the pipeline produces. Keep the directory, ignore its contents —
