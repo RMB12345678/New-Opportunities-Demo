@@ -14,8 +14,8 @@ and business logic (the rubric); Claude wrote the implementation.
 
 ## Where everything lives
 
-- **Code** — this repo, `github.com/RMB12345678/Job-Search-Agent`. Runs locally via
-  `python run.py`. Not yet on a schedule.
+- **Code** — the pipeline itself, in a private repo; this is its sanitized public
+  mirror. Runs locally via `python run.py`. Not yet on a schedule.
 - **Company data** — Notion "Target List" database, `<redacted>`
   (data source `<redacted>`). 331 companies.
 - **Job data** — Notion "Job Postings" database, `<redacted>`
@@ -94,6 +94,6 @@ Listed for pattern-matching if similar symptoms reappear.
 
 - **Aug 22, 2026** — Full code review against commit `243b2f2`; produced
   `docs/punch-list.md` (17 items). Added `CLAUDE.md`. Ported this doc into the repo.
-- **Aug 20, 2026** — Pushed to GitHub as `Job-Search-Agent` (initial commit).
+- **Aug 20, 2026** — Pushed to GitHub (initial commit).
 - **Aug 17–18, 2026** — Added Head of Product to the rubric. Added Date Applied,
   Application Notes, Application Summary to Job Postings. Fixed the bug list above.
