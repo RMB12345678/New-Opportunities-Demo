@@ -1,5 +1,26 @@
 # CLAUDE.md
 
+## Read this first: this is a public mirror
+
+This repository is a **sanitized, public copy** of a private pipeline, kept as a
+portfolio piece. It is *supposed* to differ from its private counterpart, and the
+differences are load-bearing:
+
+| File | How it differs | Why |
+|---|---|---|
+| `notion/client.py` | `os.environ["JOB_POSTINGS_DATABASE_ID"]`, no hardcoded fallback | the fallback upstream is a real Notion database id |
+| `ats_finder/find_ats.py` | extra "can be adapted to any industry" line in the research prompt | this copy is a template others can reuse |
+| `.env.example` | every id is `xxxx` | nothing real belongs in a public repo |
+| `scoring/rubric.md` | no owner name, worked-example criteria | it is a sample, not a live job search |
+| `scoring/excluded_title_keywords.json` | generic entries | same |
+| `docs/project-status.md` | all Notion ids redacted | same |
+
+**Never reconcile this repo against the private one.** If you are shown both and the
+differences read like drift, they are not drift. "Restoring consistency" would publish
+a private database id to a public repo.
+
+Nothing in `output/` is ever committed here, and no real `.env` exists.
+
 Guidance for Claude Code working in this repository.
 
 ## What this is
@@ -89,7 +110,7 @@ real failure, so preserve them unless the task explicitly says otherwise.
 
 ## Traps
 
-- **`output/*.json` is gitignored but holds real state.** `score_cache.json` (~500 KB)
+- **`output/` is gitignored in full (except `.gitkeep`) but holds real state.** `score_cache.json` (~500 KB)
   represents money already spent. `seen_jobs.json` is run history. Never delete or
   regenerate these casually.
 - **Any change to the rubric, the scoring prompt, the model, or the keyword list
