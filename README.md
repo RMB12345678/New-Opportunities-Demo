@@ -30,9 +30,9 @@ removed — that stays in a private database, not committed here.*
    rubric, so editing the rubric re-scores everything instead of serving
    stale answers.
 4. **Syncs results to Notion**, deduplicated by URL, with dedicated views
-   for new postings, scored matches, ambiguous cases needing review, and
-   non-fits. A posting is only marked closed when its company actually
-   scraped — a timeout never retires a live job.
+   for new postings, scored matches, ambiguous cases needing review,
+   non-fits, and applications sent. A posting is only marked closed when
+   its company actually scraped — a timeout never retires a live job.
 5. **Rehearses before it spends.** `--dry-run` performs every read and
    scrape but skips all writes and all paid calls, printing what it would
    have done.
@@ -68,7 +68,7 @@ flowchart TD
     S6e --> S7
 
     S7["Sync to Notion\nDedup by URL\nClose only rows whose company scraped OK\nAbort the close pass if >25% would close\nRetries with backoff on transient failures"] --> S8
-    S8["Excel export\nmirrors the Notion views"] --> End([Done])
+    S8["Excel export\nfive tabs: the four scoring views\nplus Needs Manual Check"] --> End([Done])
 
     style S4a fill:#d4edda
     style S4b fill:#fff3cd
@@ -158,7 +158,12 @@ Score (number), Routing (select: Scored / Needs Review / Non-fit),
 Reasoning (text), Ambiguity Note (text), IC Role (checkbox), Location
 (text), URL (url), ATS (text), First Seen / Last Seen (date), Still Open
 (checkbox), New This Run (checkbox), Date Applied (date), Application
-Notes (text)
+Notes (text), Application Summary (formula)
+
+Views on Job Postings: New This Run, Scored List, Needs Review,
+Non-fits, Applications. `Date Applied`, `Application Notes`, and the
+`Application Summary` formula that reads them are yours to fill in by
+hand — the pipeline never writes to them.
 
 `Careers URL` and `URL` must be Notion **URL**-type properties, not rich
 text — Notion rejects an empty string on a URL property, so empty is
