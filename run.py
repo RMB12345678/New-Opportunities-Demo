@@ -36,12 +36,14 @@ load_dotenv()  # reads the .env file in this folder and loads NOTION_API_KEY, et
 
 from notion.client import (
     get_all_companies, get_companies_missing_ats, get_companies_missing_profile,
-    get_companies_missing_url, update_ats_fields, update_company_info,
+    get_companies_missing_url, get_companies_missing_website,
+    update_ats_fields, update_company_info, update_company_website,
     sync_jobs_to_notion, sync_scrape_status,
     SCRAPE_OK, SCRAPE_FAILED, SCRAPE_NO_SCRAPER, SCRAPE_NO_URL,
     api_call_report,
 )
 from ats_finder.find_ats import find_ats, find_company_info, find_via_search
+from ats_finder.find_website import derive_website
 from scrapers import greenhouse, lever, ashby, workday, html_generic
 from scoring.score_jobs import score_all, RUBRIC_FINGERPRINT
 from scoring.track_new_postings import mark_new_postings
@@ -329,6 +331,65 @@ def fill_missing_careers_urls(dry_run=False):
         time.sleep(1)
 
 
+def fill_missing_website(dry_run=False):
+    """Backfill each company's Website property, and stamp its page icon
+    with a real logo (or a blank marker) either way — see
+    ats_finder/find_website.py for the derivation logic and
+    get_companies_missing_website() in notion/client.py for why the icon,
+    not just the Website value, is what marks a row as already checked.
+
+    Deliberately not folded into fill_missing_careers_urls(): that pass
+    runs BEFORE this one so its own backfilled Careers URLs are already in
+    Notion by the time derive_website() looks at them — a company whose
+    careers page was just discovered this run can still resolve its
+    Website for free, from the URL fill_missing_careers_urls() just wrote,
+    instead of paying for a second, separate search.
+
+    dry_run=True skips every lookup (local or Anthropic) and every write —
+    it just lists which companies would be checked, same contract as the
+    other fill_missing_* passes above.
+    """
+    missing = get_companies_missing_website()
+    if not missing:
+        print("[check] Every company already has a Website (or was already checked). Continuing.")
+        return
+
+    if dry_run:
+        print(f"[check] [dry-run] {len(missing)} company(ies) missing a Website would be "
+              f"checked (free extraction from their Careers URL first, Anthropic search "
+              f"only if that comes up empty):")
+        for row in missing:
+            print(f"  -> {row['company']}")
+        return
+
+    print(f"[check] {len(missing)} company(ies) missing a Website. Deriving now...")
+    derived, blanked, skipped = 0, 0, 0
+    for row in missing:
+        try:
+            website, icon = derive_website(row.get("careers_url"), row["company"], hq=row.get("hq"))
+        except Exception as e:
+            # A failed LOOKUP (network/API outage) is not a genuine "nothing
+            # found" — same distinction fill_missing_ats() makes. Leave the
+            # row untouched (no icon stamped) so it gets a real attempt next
+            # run instead of being permanently marked blank.
+            print(f"  -> {row['company']}: lookup failed (not a real answer, will retry next run): {e}")
+            skipped += 1
+            continue
+
+        if website:
+            print(f"  -> {row['company']}: {website}")
+            derived += 1
+        else:
+            print(f"  -> {row['company']}: no website found — stamping blank icon")
+            blanked += 1
+
+        update_company_website(row["page_id"], website=website, icon=icon)
+        time.sleep(1)  # be polite to Notion's rate limit
+
+    print(f"[check] {derived} website(s) derived, {blanked} stamped blank (nothing found), "
+          f"{skipped} left for retry next run")
+
+
 def resolve_scraper(platform_raw):
     """Find a matching scraper for a company's ATS Platform text field.
 
@@ -591,6 +652,10 @@ def main():
     print("\n=== Step 2b: checking for HTML-scrape companies missing a Careers URL ===")
     with timed("3  fill_missing_careers_urls"):
         fill_missing_careers_urls(dry_run=dry_run)
+
+    print("\n=== Step 2c: filling in company Website + logo where derivable ===")
+    with timed("3b fill_missing_website"):
+        fill_missing_website(dry_run=dry_run)
 
     print("\n=== Step 3: re-pulling full company list ===")
     with timed("3a get_all_companies"):

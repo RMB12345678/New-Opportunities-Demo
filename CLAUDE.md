@@ -66,19 +66,24 @@ you will trust it.
 2. `fill_missing_profile_fields()` — has an ATS but missing Sector or HQ.
 3. `fill_missing_careers_urls()` — any company missing a Careers URL. Fallback chain:
    dedicated careers page → homepage → pre-filled Google search.
-4. `run_scrapers()` — Greenhouse/Lever/Ashby/Workday via their public APIs; everything
+4. `fill_missing_website()` — any company with neither a `Website` value nor a page
+   icon yet. Extracts the domain from the (now-backfilled) Careers URL for free where
+   possible, an Anthropic homepage lookup otherwise; stamps the page icon with a real
+   favicon logo or a blank-square marker either way. See
+   `ats_finder/find_website.py` and invariant 16.
+5. `run_scrapers()` — Greenhouse/Lever/Ashby/Workday via their public APIs; everything
    else marked HTML gets `scrapers/html_generic.py`. Returns `(jobs, scraped_ok, statuses)`.
    Workday takes its own branch: its board needs four parameters rather than one slug,
    and it deliberately has no guess-from-the-company-name fallback.
-5. `sync_scrape_status(statuses)` — stamps every Target List row with how its scrape
+6. `sync_scrape_status(statuses)` — stamps every Target List row with how its scrape
    went. Anything not `OK` is what the Needs Manual Check view shows.
-6. `mark_new_postings()` — flags first-seen postings against `output/seen_jobs.json`.
-7. `score_all()` — batched, cached, fingerprinted, Haiku, rubric as system prompt.
-8. `sync_jobs_to_notion(jobs, scraped_ok)` — dedup by URL, create/update, close what's
+7. `mark_new_postings()` — flags first-seen postings against `output/seen_jobs.json`.
+8. `score_all()` — batched, cached, fingerprinted, Haiku, rubric as system prompt.
+9. `sync_jobs_to_notion(jobs, scraped_ok)` — dedup by URL, create/update, close what's
    genuinely gone. **Delta-only**: every owned property is compared against what Notion
    already holds and only differences are written. A steady-state run writes ~100 rows,
    not ~3,200.
-9. `build_workbook()` — five-tab Excel export.
+10. `build_workbook()` — five-tab Excel export.
 
 ## Invariants
 
@@ -153,6 +158,14 @@ real failure, so preserve them unless the task explicitly says otherwise.
     job whose scoring failed comes back with `score` and `routing` of `None`; the diff
     skips those rather than blanking a good value. Same convention as
     `update_company_info()`.
+16. **A company's page icon, not just `Website`, marks it as checked.** `Website` is a
+    URL-type property, so it can't hold a text "Not found" marker the way `ATS Platform`
+    does — writing empty means "never checked" (invariant 8) for every field except this
+    one. `fill_missing_website()` stamps the page icon either way — a real favicon on
+    success, the blank-square marker (`ats_finder.find_website.BLANK_ICON`) on a genuine
+    "nothing found" — so `get_companies_missing_website()` filters on "no icon yet", not
+    "no Website yet". A row a human iconed by hand for an unrelated reason will look
+    already-checked and won't be retried; accepted trade-off, not a bug.
 
 ## Traps
 
@@ -181,7 +194,13 @@ real failure, so preserve them unless the task explicitly says otherwise.
 **Target List** (`NOTION_DATABASE_ID`): Company (title), Sector / Focus (text), HQ
 (text), Source (text), ATS Platform (text), Scrape Method (text), Careers URL (**url**),
 Jobs (relation → Job Postings), Scrape Status (select: OK / Failed / No Scraper /
-No Careers URL), Scrape Note (text), Failing Since (date).
+No Careers URL), Scrape Note (text), Failing Since (date), Website (**url** — see
+invariant 16 and `fill_missing_website()`).
+
+The Target List page **icon** is also pipeline-owned: a Google favicon logo when
+`fill_missing_website()` derives a real domain, a plain white square when it genuinely
+can't. Don't treat a blank Website with no icon and a blank Website with an icon as the
+same state — see invariant 16.
 
 Views on Target List: Default view, Needs Manual Check (Scrape Status is not OK,
 sorted by Failing Since ascending — the oldest breakage first).

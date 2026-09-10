@@ -103,7 +103,9 @@ def _raise_with_detail(resp):
 
 def get_all_companies():
     """Return every row in the Target List database as a list of dicts:
-    [{page_id, company, sector, hq, source, ats_platform, scrape_method}, ...]
+    [{page_id, company, sector, hq, source, ats_platform, scrape_method,
+      careers_url, scrape_status, scrape_note, failing_since, website,
+      has_icon}, ...]
     """
     rows = []
     payload = {"page_size": 100}
@@ -131,6 +133,11 @@ def get_all_companies():
                 "scrape_status": _select_name(props.get("Scrape Status")),
                 "scrape_note": _plain_text(props.get("Scrape Note")),
                 "failing_since": _date_start(props.get("Failing Since")),
+                "website": _url_value(props.get("Website")),
+                # Page-level, not a property — see
+                # get_companies_missing_website()'s docstring for why this
+                # is read here rather than derived from "website" alone.
+                "has_icon": page.get("icon") is not None,
             })
 
         if not data.get("has_more"):
@@ -187,6 +194,64 @@ def get_companies_missing_url():
 
 # Kept for backward compatibility with any code still importing the old name.
 get_html_companies_missing_url = get_companies_missing_url
+
+
+def get_companies_missing_website():
+    """Return companies with no confirmed Website AND no page icon yet.
+
+    Website is a Notion URL-type property, so — unlike ATS Platform — it
+    can't hold a text marker such as "Not found" to remember a company that
+    was genuinely searched and came up empty. Without some marker,
+    invariant 8 (every "nothing found" outcome writes a non-blank value)
+    can't be satisfied here, and the same company would be re-searched, and
+    re-paid for, on every future run.
+
+    The page ICON carries that memory instead. Every company
+    ats_finder.find_website.derive_website() ever looks at gets a page icon
+    stamped one way or the other — a real favicon on success, or the plain
+    white square (BLANK_ICON) on a genuine "nothing found" — so "no icon
+    yet" is the real "never processed" signal, not "no Website value"
+    alone. Trade-off worth knowing: a company whose icon a person set by
+    hand for an unrelated reason will look identical to an already-checked
+    one and won't be retried.
+    """
+    return [row for row in get_all_companies() if not row["website"] and not row["has_icon"]]
+
+
+def update_company_website(page_id, website=None, icon=None, dry_run=False):
+    """Write a company's derived Website URL and/or page icon.
+
+    Same None-means-don't-touch convention as update_company_info(), with
+    one deliberate difference: an icon of BLANK_ICON ("⬜") is a real value
+    to write — the "checked, nothing found" stamp — not a signal to skip.
+    Only Python None skips a field, exactly as everywhere else in this
+    module.
+    """
+    properties = {}
+    if website is not None:
+        properties["Website"] = {"url": website or None}
+
+    payload = {}
+    if properties:
+        payload["properties"] = properties
+    if icon is not None:
+        if icon.startswith("http://") or icon.startswith("https://"):
+            payload["icon"] = {"type": "external", "external": {"url": icon}}
+        else:
+            payload["icon"] = {"type": "emoji", "emoji": icon}
+
+    if not payload:
+        return None
+
+    _count("write:company_website")
+    if dry_run:
+        print(f"     [dry-run] would update {page_id}: "
+              f"website={website!r} icon={'set' if icon else None}")
+        return None
+
+    resp = session.patch(f"{BASE_URL}/pages/{page_id}", headers=HEADERS, json=payload)
+    _raise_with_detail(resp)
+    return resp.json()
 
 
 def update_company_info(page_id, sector=None, hq=None, source=None,
