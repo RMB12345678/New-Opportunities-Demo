@@ -17,10 +17,11 @@ and business logic (the rubric); Claude wrote the implementation.
 
 - **Code** — the pipeline itself, in a private repo; this is its sanitized public
   mirror. Runs locally via `python run.py`. Not yet on a schedule.
-- **Company data** — Notion "Target List" database, `<redacted>`
+- **Company data** — Notion "Companies" database (renamed from "Target List" on
+  2026-09-10; same id, same data source, display name only), `<redacted>`
   (data source `<redacted>`). ~425 companies.
 - **Job data** — Notion "Job Postings" database, `<redacted>`
-  (data source `<redacted>`). Related to Target List via a
+  (data source `<redacted>`). Related to Companies via a
   "Company" relation. ~3,200 rows as of the Sep 9 run.
 - **Dashboard** — Notion "Active Opportunities" page, `<redacted>`.
   Active Roles, To Do, Job Boards (ExecuNet, Reccy, Kidneyverse/Signals), and link
@@ -99,7 +100,7 @@ Listed for pattern-matching if similar symptoms reappear.
 - **Scrape coverage is the biggest gap.** On the Sep 9 run, 87 companies produced
   3,132 postings and 203 produced nothing scrapeable: 169 with no scraper (mostly
   companies whose ATS research came back "Not found"), 32 whose scrape failed, and 2
-  with no Careers URL. Those surface in the Needs Manual Check view on Target List,
+  with no Careers URL. Those surface in the Needs Manual Check view on Companies,
   sorted by `Failing Since` so the oldest breakage is first. Punch list #5 and #19
   cover the code side; the headless-browser question for JavaScript-rendered job
   lists is still open.
@@ -128,6 +129,11 @@ Listed for pattern-matching if similar symptoms reappear.
 
 ## Changelog
 
+- **Sep 10, 2026** — Added a `Website` property to the Target List plus a pipeline step,
+  `fill_missing_website()`, that derives it (free extraction from the Careers URL first,
+  an Anthropic homepage search only if that fails) and stamps the page icon with a real
+  favicon logo or a plain white square either way — see `ats_finder/find_website.py`
+  and invariant 16 in `CLAUDE.md`.
 - **Sep 9, 2026** — Delta-only Job Postings sync (#20): the sync now reads back every
   property it owns and writes only the rows that moved, cutting a steady-state run
   from ~3,273 writes to ~100. Found and fixed the select-casing comparison bug in the
