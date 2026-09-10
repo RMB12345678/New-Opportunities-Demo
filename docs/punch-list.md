@@ -180,8 +180,9 @@ The status doc counts ~90 companies with no ATS found. Some share may be truncat
    Anchor to line starts and take the last match:
    `re.findall(rf"^{label}:\s*(.+)$", text, re.M)[-1]`
 5. Recovery: clear ATS Platform on every row reading `"Not found (auto-search failed)"`
-   so the next run redoes them. `reset_pe_vc_firms.py` is the template — same
-   operation, different marker string. Run this **after #7**.
+   so the next run redoes them. The shape is a small one-off script that finds every
+   row carrying the marker, clears the field, and stops — no scraping, no scoring.
+   Run this **after #7**.
 
 ## 4. The score cache ignores rubric changes
 **Critical** · `scoring/score_jobs.py` → `_job_key()`, `score_all()`
@@ -283,7 +284,7 @@ per job plus full pagination on two databases. The sync runs *after* scoring, so
 raises having already spent the money, leaving Notion half-written with no resume point.
 
 **Fix**
-1. One shared session in a small `http.py`:
+1. One shared session in a small `http_client.py`:
    ```python
    from requests.adapters import HTTPAdapter
    from urllib3.util.retry import Retry
