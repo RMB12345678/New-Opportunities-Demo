@@ -28,7 +28,8 @@ import json
 import os
 import re
 import time
-from urllib.parse import quote_plus
+from contextlib import contextmanager
+from urllib.parse import quote_plus, unquote
 
 from dotenv import load_dotenv
 load_dotenv()  # reads the .env file in this folder and loads NOTION_API_KEY, etc.
@@ -36,18 +37,75 @@ load_dotenv()  # reads the .env file in this folder and loads NOTION_API_KEY, et
 from notion.client import (
     get_all_companies, get_companies_missing_ats, get_companies_missing_profile,
     get_companies_missing_url, update_ats_fields, update_company_info,
-    sync_jobs_to_notion,
+    sync_jobs_to_notion, sync_scrape_status,
+    SCRAPE_OK, SCRAPE_FAILED, SCRAPE_NO_SCRAPER, SCRAPE_NO_URL,
+    api_call_report,
 )
 from ats_finder.find_ats import find_ats, find_company_info, find_via_search
-from scrapers import greenhouse, lever, ashby, html_generic
-from scoring.score_jobs import score_all
+from scrapers import greenhouse, lever, ashby, workday, html_generic
+from scoring.score_jobs import score_all, RUBRIC_FINGERPRINT
 from scoring.track_new_postings import mark_new_postings
 from output_excel import build_workbook
+
+# --- step timing ------------------------------------------------------
+# Wall clock per pipeline step, printed as a table at the end of the run.
+# This exists because "the run got slow" is not a diagnosis: with nine
+# steps, three of which talk to Notion and one of which talks to 236
+# websites, the cost could plausibly sit in any of them, and the obvious
+# suspect (scoring) turned out to be the cheapest. Measure, then cut.
+#
+# perf_counter rather than time.time: monotonic, so a clock adjustment
+# mid-run can't produce a negative step.
+_STEP_TIMINGS = []
+
+
+@contextmanager
+def timed(label):
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        _STEP_TIMINGS.append((label, time.perf_counter() - start))
+
+
+def print_timing_report():
+    if not _STEP_TIMINGS:
+        return
+    total = sum(seconds for _, seconds in _STEP_TIMINGS)
+    width = max(len(label) for label, _ in _STEP_TIMINGS)
+    print("\n=== Timing (wall clock per step) ===")
+    for label, seconds in _STEP_TIMINGS:
+        share = (100.0 * seconds / total) if total else 0.0
+        print(f"  {label:<{width}}  {seconds:8.1f}s  {share:5.1f}%")
+    print(f"  {'TOTAL':<{width}}  {total:8.1f}s")
+
+
+def print_api_report(dry_run=False):
+    """Notion request volume for the run, split reads vs. writes. A read
+    pages 100 rows at a time; a write is one row plus a throttle sleep, so
+    the write count is what actually sets the wall clock of the sync.
+
+    Under --dry-run these are the writes a real run WOULD have made: the
+    counters deliberately sit before the dry-run short-circuit in each
+    helper, because a rehearsal that reported zero writes would answer the
+    one question it exists to answer with a number that is always zero."""
+    report = api_call_report()
+    label = "planned Notion API calls (dry run — nothing was written)" if dry_run         else "Notion API calls"
+    print(f"\n=== {label} ===")
+    for kind, count in sorted(report["reads"].items()):
+        print(f"  {kind:<28} {count:6}")
+    print(f"  {'READS (total)':<28} {report['read_total']:6}")
+    for kind, count in sorted(report["writes"].items()):
+        print(f"  {kind:<28} {count:6}")
+    print(f"  {'WRITES (total)':<28} {report['write_total']:6}")
+    print(f"  {'~throttle cost of writes':<28} {report['write_total'] * 0.35:6.0f}s")
+
 
 SCRAPERS = {
     "Greenhouse": greenhouse.fetch_jobs,
     "Lever": lever.fetch_jobs,
     "Ashby": ashby.fetch_jobs,
+    "Workday": workday.fetch_jobs,
 }
 
 
@@ -314,7 +372,7 @@ SLUG_URL_PATTERNS = {
         r"boards-api\.greenhouse\.io/v1/boards/([a-zA-Z0-9\-_]+)",
     ],
     "Lever": [r"jobs\.lever\.co/([a-zA-Z0-9\-_]+)"],
-    "Ashby": [r"jobs\.ashbyhq\.com/([a-zA-Z0-9\-_]+)"],
+    "Ashby": [r"jobs\.ashbyhq\.com/([^/?#]+)"],
 }
 
 
@@ -325,12 +383,30 @@ def extract_slug(careers_url, platform_name):
     for pattern in SLUG_URL_PATTERNS[platform_name]:
         m = re.search(pattern, careers_url)
         if m:
-            return m.group(1)
+            return unquote(m.group(1))
     return None
 
 
+def extract_workday_params(careers_url):
+    """Workday's answer to extract_slug().
+
+    The single-slug platforms above are identified by one token, so
+    extract_slug() can return a string. A Workday board takes four pieces
+    (host, wd number, tenant, site) plus an optional facet filter for the
+    shared tenants, so it needs its own resolver rather than a wider
+    contract on extract_slug() that the other three would have to ignore.
+
+    Returns None when the saved URL is not a myworkdayjobs.com board — a
+    marketing careers page, say. That None is deliberately NOT a soft
+    failure that falls through to the generic HTML scraper: HTML is what
+    produced the false zeros for every Workday company in the first place,
+    so an unparseable URL is flagged for a human instead.
+    """
+    return workday.parse_board_url(careers_url)
+
+
 def run_scrapers(companies):
-    """Scrape every company and return (all_jobs, skipped, scraped_ok).
+    """Scrape every company and return (all_jobs, scraped_ok, statuses).
 
     scraped_ok is the set of company names whose scraper returned without
     raising. It exists so sync_jobs_to_notion() can tell "this company's
@@ -350,13 +426,63 @@ def run_scrapers(companies):
     Companies with no matching scraper never enter the set either. They
     were never attempted, so their postings' absence proves exactly as
     little as a failure does.
+
+    statuses is one record per company saying how its scrape went, in the
+    shape sync_scrape_status() writes to Notion. Every record whose status
+    is not SCRAPE_OK is a company no technique reached, and its note says
+    which technique was tried and how it failed. That set used to be
+    returned separately as `skipped`, but it is derivable from statuses by
+    definition, and this repo has already been bitten once by keeping two
+    independent records of the same fact and watching them drift
+    (invariant 9). One record, one answer.
     """
     all_jobs = []
-    skipped = []
     scraped_ok = set()
+    statuses = []
+
+    def record(row, status, note=""):
+        statuses.append({"row": row, "status": status, "note": note})
 
     for row in companies:
         scraper, matched_name = resolve_scraper(row["ats_platform"])
+
+        # Workday takes its own path: its scraper needs four parameters
+        # rather than one slug, and — unlike the slug platforms — it has no
+        # guess-from-the-company-name fallback, because a guessed Workday
+        # tenant can resolve to a real board belonging to someone else.
+        if scraper and matched_name == "Workday":
+            params = extract_workday_params(row.get("careers_url"))
+            if not params:
+                if not row.get("careers_url"):
+                    print(f"[scrape] {row['company']}: no Careers URL — Workday board "
+                          f"parameters can't be guessed, needs manual lookup")
+                    record(row, SCRAPE_NO_URL,
+                           "Workday: no Careers URL saved. A Workday board needs a real "
+                           "host/tenant/site, which can't be guessed from the company "
+                           "name, so this needs the board URL filled in by hand.")
+                else:
+                    print(f"[scrape] {row['company']}: saved Careers URL is not a Workday "
+                          f"board — needs manual lookup")
+                    record(row, SCRAPE_FAILED,
+                           f"Workday: the saved Careers URL ({row['careers_url']}) is not a "
+                           f"myworkdayjobs.com board URL, so the board parameters can't be "
+                           f"read from it. Find the real board (usually linked from that "
+                           f"page) and save it instead.")
+                continue
+            try:
+                jobs = workday.fetch_jobs(row["company"], **params)
+                for job in jobs:
+                    job["company_description"] = row.get("sector")
+                all_jobs.extend(jobs)
+                scraped_ok.add(row["company"])
+                filtered = " filtered to this company" if params["applied_facets"] else ""
+                print(f"[scrape] {row['company']} (via Workday, "
+                      f"{params['tenant']}/{params['site']}{filtered}): {len(jobs)} jobs")
+                record(row, SCRAPE_OK, f"Workday: {len(jobs)} job(s)")
+            except Exception as error:
+                print(f"[scrape] {row['company']}: FAILED ({error})")
+                record(row, SCRAPE_FAILED, f"Workday: {error}")
+            continue
 
         if scraper:
             slug = extract_slug(row.get("careers_url"), matched_name)
@@ -368,6 +494,7 @@ def run_scrapers(companies):
                 scraped_ok.add(row["company"])
                 slug_note = f", slug from saved URL" if slug else ""
                 print(f"[scrape] {row['company']} (via {matched_name}{slug_note}): {len(jobs)} jobs")
+                record(row, SCRAPE_OK, f"{matched_name}: {len(jobs)} job(s)")
                 continue
             except Exception as first_error:
                 # If we had a confirmed slug and it still failed (URL moved,
@@ -382,15 +509,28 @@ def run_scrapers(companies):
                         scraped_ok.add(row["company"])
                         print(f"[scrape] {row['company']} (via {matched_name}, "
                               f"saved URL failed, guessed slug worked): {len(jobs)} jobs")
+                        # Scraped fine, so not a manual-check case — but the
+                        # saved Careers URL is stale, and saying so in the note
+                        # is the only place that ever gets recorded.
+                        record(row, SCRAPE_OK,
+                               f"{matched_name}: {len(jobs)} job(s). The slug from the "
+                               f"saved Careers URL failed and a guessed slug worked, so "
+                               f"the saved URL is probably stale.")
                         continue
                     except Exception as second_error:
                         print(f"[scrape] {row['company']}: FAILED — both saved URL slug "
                               f"({first_error}) and guessed slug ({second_error}) failed")
-                        skipped.append(row)
+                        record(row, SCRAPE_FAILED,
+                               f"{matched_name}: the slug from the saved Careers URL "
+                               f"failed ({first_error}) and a guessed slug failed too "
+                               f"({second_error}). Check the company's real board URL.")
                         continue
                 print(f"[scrape] {row['company']}: FAILED ({first_error}) "
                       f"— no saved Careers URL to fall back on, was guessing the slug")
-                skipped.append(row)
+                record(row, SCRAPE_FAILED,
+                       f"{matched_name}: {first_error}. There is no saved Careers URL to "
+                       f"take a real slug from, so the slug was guessed from the company "
+                       f"name. Saving the real board URL would likely fix this.")
                 continue
 
         # No API-backed scraper matched — try the generic HTML scraper if
@@ -406,13 +546,26 @@ def run_scrapers(companies):
                 all_jobs.extend(jobs)
                 scraped_ok.add(row["company"])
                 print(f"[scrape] {row['company']} (via HTML): {len(jobs)} jobs")
+                record(row, SCRAPE_OK, f"HTML: {len(jobs)} job(s)")
             except Exception as e:
                 print(f"[scrape] {row['company']} (HTML): FAILED ({e})")
-                skipped.append(row)
+                record(row, SCRAPE_FAILED,
+                       f"HTML scrape of {row['careers_url']} failed: {e}")
+        elif is_html:
+            # Marked HTML-scrapeable, but step 2b never managed to save a URL
+            # to point the scraper at — not even the Google-search fallback.
+            record(row, SCRAPE_NO_URL,
+                   "Marked HTML-scrapeable but has no saved Careers URL to fetch. "
+                   "The Careers URL backfill has already tried and come up empty.")
         else:
-            skipped.append(row)
+            ats = row["ats_platform"] or "(blank)"
+            method = row["scrape_method"] or "(blank)"
+            record(row, SCRAPE_NO_SCRAPER,
+                   f"No scraper handles ATS Platform \"{ats}\" with Scrape Method "
+                   f"\"{method}\". Either the platform needs a scraper written, or the "
+                   f"row needs marking as HTML-scrapeable.")
 
-    return all_jobs, skipped, scraped_ok
+    return all_jobs, scraped_ok, statuses
 
 
 def main():
@@ -428,36 +581,60 @@ def main():
         print("=== DRY RUN — no Notion writes or Anthropic calls will be made ===")
 
     print("=== Step 1-2: checking Notion for companies missing ATS data ===")
-    fill_missing_ats(dry_run=dry_run)
+    with timed("1  fill_missing_ats"):
+        fill_missing_ats(dry_run=dry_run)
 
     print("\n=== Step 2a: backfilling sector/HQ for companies missing it ===")
-    fill_missing_profile_fields(dry_run=dry_run)
+    with timed("2  fill_missing_profile_fields"):
+        fill_missing_profile_fields(dry_run=dry_run)
 
     print("\n=== Step 2b: checking for HTML-scrape companies missing a Careers URL ===")
-    fill_missing_careers_urls(dry_run=dry_run)
+    with timed("3  fill_missing_careers_urls"):
+        fill_missing_careers_urls(dry_run=dry_run)
 
     print("\n=== Step 3: re-pulling full company list ===")
-    companies = get_all_companies()
+    with timed("3a get_all_companies"):
+        companies = get_all_companies()
     print(f"{len(companies)} total companies")
 
     print("\n=== Step 4-5: scraping API-backed companies ===")
-    jobs, skipped, scraped_ok = run_scrapers(companies)
+    with timed("4  run_scrapers"):
+        jobs, scraped_ok, statuses = run_scrapers(companies)
     print(f"{len(scraped_ok)} company(ies) scraped successfully; only their postings "
           f"are eligible to be marked closed below")
 
+    print("\n=== Step 5a: stamping scrape status onto the Target List ===")
+    needs_check = [s for s in statuses if s["status"] != SCRAPE_OK]
+    with timed("5  sync_scrape_status"):
+        status_result = sync_scrape_status(statuses, dry_run=dry_run)
+    tail = f", {status_result['failed']} failed to write" if status_result["failed"] else ""
+    print(f"{status_result['written']} row(s) restamped, "
+          f"{status_result['unchanged']} already correct{tail}")
+    print(f"{len(needs_check)} company(ies) need a manual look — they are the "
+          f"\"Needs Manual Check\" view on the Target List in Notion:")
+    for entry in needs_check[:15]:
+        print(f"       - {entry['row']['company']} [{entry['status']}]: {entry['note']}")
+    if len(needs_check) > 15:
+        print(f"       ... and {len(needs_check) - 15} more")
+
     print("\n=== Step 6: flagging new postings vs. previous runs ===")
-    jobs = mark_new_postings(jobs, dry_run=dry_run)
+    with timed("6  mark_new_postings"):
+        jobs = mark_new_postings(jobs, dry_run=dry_run)
     new_count = sum(1 for j in jobs if j["is_new"])
     print(f"{new_count} new posting(s) since the last run, {len(jobs) - new_count} already seen before")
 
     print("\n=== Step 7: scoring jobs against the rubric ===")
-    jobs = score_all(jobs, dry_run=dry_run)
+    with timed("7  score_all"):
+        jobs = score_all(jobs, dry_run=dry_run)
     print(f"Scored {len(jobs)} jobs")
 
     print("\n=== Step 8: syncing jobs to Notion ===")
-    sync_result = sync_jobs_to_notion(jobs, scraped_ok, dry_run=dry_run)
+    with timed("8  sync_jobs_to_notion"):
+        sync_result = sync_jobs_to_notion(jobs, scraped_ok, dry_run=dry_run,
+                                          rubric_fingerprint=RUBRIC_FINGERPRINT)
     print(f"{'[dry-run] would sync' if dry_run else 'Notion'}: "
           f"{sync_result['created']} created, {sync_result['updated']} updated, "
+          f"{sync_result['unchanged']} unchanged (not written), "
           f"{sync_result['closed']} marked closed (no longer posted)")
     if sync_result.get("close_aborted"):
         print("[warn] the close pass was aborted by the 25% safety valve — see above. "
@@ -473,14 +650,28 @@ def main():
     with open("output/jobs.json", "w") as f:
         json.dump(jobs, f, indent=2)
 
+    # Same set as the Notion view, kept on disk for the Excel tab and for
+    # diffing one run against another without going through the API.
     with open("output/skipped_companies.json", "w") as f:
-        json.dump([{"company": s["company"], "sector": s.get("sector"), "ats_platform": s["ats_platform"]} for s in skipped], f, indent=2)
+        json.dump([{
+            "company": e["row"]["company"],
+            "sector": e["row"].get("sector"),
+            "ats_platform": e["row"]["ats_platform"],
+            "careers_url": e["row"].get("careers_url"),
+            "status": e["status"],
+            "note": e["note"],
+        } for e in needs_check], f, indent=2)
 
-    excel_path = build_workbook()
+    with timed("9  build_workbook"):
+        excel_path = build_workbook()
 
     print(f"\nDone. {len(jobs)} jobs written to output/jobs.json")
-    print(f"{len(skipped)} companies need manual/HTML scraping — see output/skipped_companies.json")
+    print(f"{len(needs_check)} companies need manual checking — see the "
+          f"\"Needs Manual Check\" view in Notion, or output/skipped_companies.json")
     print(f"Formatted Excel version: {excel_path}")
+
+    print_timing_report()
+    print_api_report(dry_run=dry_run)
 
 
 if __name__ == "__main__":

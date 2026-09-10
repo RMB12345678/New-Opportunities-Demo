@@ -84,9 +84,16 @@ def build_workbook(jobs_path="output/jobs.json",
     _style_sheet(ws_nonfit, score_headers, [job_row(j) for j in non_fit_jobs], col_widths)
 
     ws_skipped = wb.create_sheet("Needs Manual Check")
-    skip_headers = ["Company", "Description", "ATS Platform (as recorded)"]
-    skip_rows = [[s.get("company"), s.get("sector"), s.get("ats_platform")] for s in skipped]
-    _style_sheet(ws_skipped, skip_headers, skip_rows, col_widths=[30, 40, 32])
+    # Status and Reason come from the same records that drive the "Needs
+    # Manual Check" view in Notion, so the two agree by construction. They are
+    # read with .get() because a skipped_companies.json written before those
+    # fields existed still has to open.
+    skip_headers = ["Company", "Status", "Reason", "Description",
+                     "ATS Platform (as recorded)", "Careers URL"]
+    skip_rows = [[s.get("company"), s.get("status"), s.get("note"), s.get("sector"),
+                   s.get("ats_platform"), s.get("careers_url")] for s in skipped]
+    _style_sheet(ws_skipped, skip_headers, skip_rows,
+                  col_widths=[30, 16, 60, 40, 32, 42])
 
     wb.save(output_path)
     return output_path

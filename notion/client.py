@@ -8,11 +8,13 @@ Target List database via "Connections" in Notion's UI).
 Requires env var NOTION_DATABASE_ID (the ID of the Target List database,
 found in its page URL).
 """
+import collections
 import os
 import time
 import requests
 
 from http_client import session
+from notion import state
 
 NOTION_API_KEY = os.environ["NOTION_API_KEY"]
 NOTION_DATABASE_ID = os.environ["NOTION_DATABASE_ID"]
@@ -31,12 +33,54 @@ CLOSE_VALVE_MAX_FRACTION = 0.25
 # inside the limit, so the valve only speaks up about genuine clusters.
 CLOSE_VALVE_MIN_OPEN_ROWS = 20
 
+# Scrape Status values stamped onto every Target List row after each run.
+# Anything other than SCRAPE_OK means no technique reached that company's
+# postings, and those rows are what the "Needs Manual Check" view in Notion
+# filters for. They are deliberately coarse: the Scrape Note carries the
+# detail, the status carries the shape of the problem, and the shape is what
+# decides what fixing it involves (a broken slug is not a missing URL is not
+# an ATS nobody has written a scraper for).
+SCRAPE_OK = "OK"                      # a scraper ran and returned; zero jobs counts
+SCRAPE_FAILED = "Failed"              # a scraper ran and raised
+SCRAPE_NO_SCRAPER = "No Scraper"      # nothing matched this ATS Platform value
+SCRAPE_NO_URL = "No Careers URL"      # marked HTML-scrapeable with nothing to fetch
+
 BASE_URL = "https://api.notion.com/v1"
 HEADERS = {
     "Authorization": f"Bearer {NOTION_API_KEY}",
     "Notion-Version": NOTION_VERSION,
     "Content-Type": "application/json",
 }
+
+
+# --- API call accounting ---------------------------------------------
+# Every Notion request this module makes is funnelled through one of the
+# helpers that bump these counters, so they are the only count that cannot
+# drift from what actually went over the wire. Writes are counted even
+# under --dry-run, where the helper returns before the request: the whole
+# point of a dry run is to see the write volume a real run *would* cost,
+# and a counter that only counts real writes would report zero for it.
+API_CALLS = collections.Counter()
+
+
+def _count(kind):
+    API_CALLS[kind] += 1
+
+
+def reset_api_calls():
+    API_CALLS.clear()
+
+
+def api_call_report():
+    """Reads and writes split out, since they cost very differently: a read
+    pages 100 rows at a time, a write is one row and carries a throttle
+    sleep. A run dominated by writes is a run with a delta problem."""
+    reads = {k: v for k, v in API_CALLS.items() if k.startswith("read:")}
+    writes = {k: v for k, v in API_CALLS.items() if k.startswith("write:")}
+    return {
+        "reads": reads, "writes": writes,
+        "read_total": sum(reads.values()), "write_total": sum(writes.values()),
+    }
 
 
 def _raise_with_detail(resp):
@@ -66,6 +110,7 @@ def get_all_companies():
     url = f"{BASE_URL}/databases/{NOTION_DATABASE_ID}/query"
 
     while True:
+        _count("read:target_list_page")
         resp = session.post(url, headers=HEADERS, json=payload)
         _raise_with_detail(resp)
         data = resp.json()
@@ -81,6 +126,11 @@ def get_all_companies():
                 "ats_platform": _plain_text(props.get("ATS Platform")),
                 "scrape_method": _plain_text(props.get("Scrape Method")),
                 "careers_url": _url_value(props.get("Careers URL")),
+                # Read back so sync_scrape_status() can skip rows whose stamp
+                # hasn't moved since the last run — see its docstring.
+                "scrape_status": _select_name(props.get("Scrape Status")),
+                "scrape_note": _plain_text(props.get("Scrape Note")),
+                "failing_since": _date_start(props.get("Failing Since")),
             })
 
         if not data.get("has_more"):
@@ -171,6 +221,7 @@ def update_company_info(page_id, sector=None, hq=None, source=None,
     if not properties:
         return None
 
+    _count("write:company_info")
     if dry_run:
         print(f"     [dry-run] would update {page_id}: {list(properties.keys())}")
         return None
@@ -189,13 +240,304 @@ def update_ats_fields(page_id, ats_platform, scrape_method, careers_url=None, dr
     )
 
 
-def sync_jobs_to_notion(jobs, scraped_ok, dry_run=False):
+def sync_scrape_status(statuses, dry_run=False):
+    """Stamp every Target List row with how this run's scrape of it went.
+
+    `statuses` is what run_scrapers() collected: one record per company,
+    holding the row it came from, the outcome, and a note explaining it.
+    Every record whose status is not SCRAPE_OK is a company no scraping
+    technique could cover, which is exactly the set the "Needs Manual
+    Check" view in Notion shows. That view is the point of this function.
+    Before it existed, a company that failed every single run just sat in
+    output/skipped_companies.json — a file nobody opens — and stayed
+    broken indefinitely, because nothing ever surfaced it.
+
+    Two deliberate departures from how the rest of this module writes:
+
+    - It overwrites non-empty fields, which invariant 3 forbids for the
+      backfill paths. That is correct here and only here: these three
+      properties are a status stamp owned by the pipeline, not researched
+      facts a human might have corrected by hand. Nothing else should copy
+      this pattern.
+
+    - It writes only rows whose stamp actually changed. A healthy run has
+      several hundred companies scraping fine with nothing new to say, and
+      PATCHing every one of them to rewrite identical values would add
+      minutes of wall clock against Notion's rate limit for no information
+      gained.
+
+    `Failing Since` answers the question the view exists to answer — how
+    long has this been broken — so it is set on the transition INTO a
+    failing state and left alone while the company keeps failing. Coming
+    back to OK clears it. Re-stamping it every run would make it a slower
+    way of saying "today", which tells you nothing.
+    """
+    from datetime import date
+    today = date.today().isoformat()
+
+    written, unchanged, failed = 0, 0, 0
+
+    for record in statuses:
+        row = record["row"]
+        status = record["status"]
+        note = record.get("note") or ""
+
+        was_failing = row.get("scrape_status") not in (None, SCRAPE_OK)
+        if status == SCRAPE_OK:
+            failing_since = None
+        elif was_failing and row.get("failing_since"):
+            failing_since = row["failing_since"]  # already broken; keep the original date
+        else:
+            failing_since = today
+
+        if (status == row.get("scrape_status")
+                and note == (row.get("scrape_note") or "")
+                and failing_since == row.get("failing_since")):
+            unchanged += 1
+            continue
+
+        try:
+            _write_scrape_status(row["page_id"], status, note, failing_since, dry_run=dry_run)
+            written += 1
+        except Exception as e:
+            # Same reasoning as the job sync below: one row's PATCH failing
+            # is not worth losing everything that comes after this call. The
+            # stamp is derived state and the next run recomputes it from
+            # scratch, so a miss here costs one run's visibility, nothing more.
+            print(f"     [status write failed] {row.get('company')}: {e}")
+            failed += 1
+
+    return {"written": written, "unchanged": unchanged, "failed": failed}
+
+
+def _write_scrape_status(page_id, status, note, failing_since, dry_run=False):
+    """Write the three Scrape Status properties onto one Target List page.
+
+    Scrape Status is a Notion select, so the value has to be one of the
+    options defined on the property — the SCRAPE_* constants above are those
+    names and have to stay in step with them. Failing Since is a date
+    property, where clearing it means {"date": None}; an empty dict instead
+    is a malformed date and Notion rejects the whole request.
+    """
+    properties = {
+        "Scrape Status": {"select": {"name": status}},
+        "Scrape Note": (
+            {"rich_text": [{"text": {"content": note[:2000]}}]} if note
+            else {"rich_text": []}
+        ),
+        "Failing Since": {"date": {"start": failing_since} if failing_since else None},
+    }
+
+    _count("write:scrape_status")
+    if dry_run:
+        print(f"     [dry-run] would set Scrape Status = {status} on {page_id}")
+        return None
+
+    resp = session.patch(f"{BASE_URL}/pages/{page_id}", headers=HEADERS,
+                         json={"properties": properties})
+    _raise_with_detail(resp)
+    return resp.json()
+
+
+# Notion truncates nothing on its own — _build_job_properties() does, at
+# 2000 characters. Any comparison has to truncate the desired value the
+# same way, or a longer-than-2000 Reasoning would read back shorter than
+# what we meant to write, compare unequal, and rewrite its row on every
+# run forever. Same class of bug as the one _date_start() documents.
+TEXT_LIMIT = 2000
+
+
+def _norm_text(value):
+    """Normalise a text field so the two sides of a diff are comparable.
+
+    Notion returns None for an empty rich_text; the scrapers return "".
+    Left alone, that difference alone would mark every job with no
+    Ambiguity Note as changed on every run.
+    """
+    return (value or "")[:TEXT_LIMIT]
+
+
+def _scores_equal(desired, current):
+    """Score is a Notion number, so it can come back as 7.0 where the
+    scorer produced 7. Comparing those with == would rewrite the row every
+    run for no reason."""
+    if desired is None or current is None:
+        return desired is None and current is None
+    return abs(float(desired) - float(current)) < 1e-9
+
+
+def _selects_equal(desired, current):
+    """Compare a Notion select case-insensitively.
+
+    Notion matches an incoming select name against its existing options
+    case-insensitively and then returns its OWN canonical casing. The
+    pipeline emits "Needs review"; the option in the database is named
+    "Needs Review", so every write was accepted, stored as "Needs Review",
+    and read back differing from what we asked for.
+
+    Under a naive == that is a change that never resolves: it rewrote 745
+    rows on every run, forever, while the sync reported itself healthy.
+    That was 93% of the writes left after the delta pass and is exactly the
+    trap invariant 13 is about — caught only because the dry run prints the
+    reason for each planned write, and the reason read
+    "Routing: Needs Review -> Needs review".
+
+    Fixing this here rather than in the scorer is deliberate: the scorer's
+    literal is also what output_excel.py filters its Needs Review tab on,
+    so changing the emitted string to match Notion's casing would silently
+    empty that tab.
+    """
+    if desired is None or current is None:
+        return desired is None and current is None
+    return desired.strip().casefold() == current.strip().casefold()
+
+
+def _desired_job_fields(job):
+    """The value this pipeline wants each owned property to hold, normalised
+    for comparison. Deliberately excludes Last Seen, First Seen, Still
+    Open, New This Run and the Company relation: those are not derived
+    from the job payload the way these are, and each has its own rule
+    about when it may be written. Also excludes Date Applied and
+    Application Notes, which belong to the human, not the pipeline."""
+    return {
+        "title": _norm_text(job.get("title") or "(untitled)"),
+        "Score": job.get("score"),
+        "Routing": job.get("routing"),
+        "Reasoning": _norm_text(job.get("reasoning")),
+        "Ambiguity Note": _norm_text(job.get("ambiguity_note")),
+        "IC Role": bool(job.get("ic_role_flag")),
+        "Location": _norm_text(job.get("location")),
+        "ATS": _norm_text(job.get("source_ats")),
+    }
+
+
+def _current_job_fields(row):
+    """The same set of properties as _desired_job_fields(), read back off
+    the Notion row and normalised identically so the two can be compared
+    key by key."""
+    return {
+        "title": _norm_text(row.get("title")),
+        "Score": row.get("score"),
+        "Routing": row.get("routing"),
+        "Reasoning": _norm_text(row.get("reasoning")),
+        "Ambiguity Note": _norm_text(row.get("ambiguity_note")),
+        "IC Role": bool(row.get("ic_role")),
+        "Location": _norm_text(row.get("location")),
+        "ATS": _norm_text(row.get("ats")),
+    }
+
+
+def _to_write_value(key, value):
+    """Translate a normalised comparison value back into the flat form
+    _build_job_properties() expects."""
+    if key == "IC Role":
+        return "__YES__" if value else "__NO__"
+    return value
+
+
+def _desired_write_properties(job, company_page_id):
+    """Every owned property, in write form. Used when creating a row,
+    where there is nothing to diff against and all of it has to go."""
+    properties = {key: _to_write_value(key, value)
+                  for key, value in _desired_job_fields(job).items()}
+    if company_page_id:
+        properties["Company"] = [company_page_id]
+    return properties
+
+
+def _changed_job_properties(job, row, company_page_id):
+    """Return only the properties whose value actually differs from what
+    Notion holds for this row, in write form. An empty dict means the row
+    is already correct and must not be written at all — that is where the
+    entire saving comes from.
+    """
+    desired = _desired_job_fields(job)
+    current = _current_job_fields(row)
+
+    changed = {}
+    for key, want in desired.items():
+        # None means "no answer this run", not "clear the field" — the same
+        # convention update_company_info() uses, and for the same reason. A
+        # job whose scoring failed comes back with score and routing None;
+        # writing that would blank a good score, and _build_job_properties()
+        # drops None anyway, so the PATCH would go out carrying nothing.
+        if want is None:
+            continue
+        have = current.get(key)
+        if key == "Score":
+            same = _scores_equal(want, have)
+        elif key == "Routing":
+            same = _selects_equal(want, have)
+        else:
+            same = want == have
+        if not same:
+            changed[key] = _to_write_value(key, want)
+
+    # Still Open: this URL came back in today's scrape, so the posting is
+    # live. Only written when the row currently disagrees — which happens
+    # when a posting closed and later reappeared, and is the one path that
+    # brings a closed row back into the Scored List view.
+    if not row.get("still_open"):
+        changed["Still Open"] = "__YES__"
+
+    # New This Run: false for anything that already existed in Notion.
+    # Written only where the box is actually ticked, which in a steady
+    # state is just the previous run's creations — tens of rows rather
+    # than the whole table. This is the same answer the old code wrote on
+    # every row every run; the only change is asking first.
+    if row.get("new_this_run"):
+        changed["New This Run"] = "__NO__"
+
+    # A missing company_page_id means the company isn't in the Target List
+    # under this name. Leave the existing relation alone rather than
+    # clearing it: an unresolved relation is what stops the close pass
+    # touching a row, so silently blanking one would put a live posting
+    # permanently beyond the reach of both passes.
+    if company_page_id and row.get("company_page_id") != company_page_id:
+        changed["Company"] = [company_page_id]
+
+    return changed
+
+
+def _describe_changes(job, row, changed):
+    """Human-readable reason for a planned write, for the dry-run log.
+    Names the field and what it is moving from and to, because "would
+    update page X" on its own gives a reader no way to tell a real change
+    from a comparison bug."""
+    current = _current_job_fields(row)
+    desired = _desired_job_fields(job)
+    parts = []
+    for key in sorted(changed):
+        if key == "Still Open":
+            parts.append("reopened (Still Open false -> true)")
+        elif key == "New This Run":
+            parts.append("clearing last run's New This Run flag")
+        elif key == "Company":
+            parts.append("Company relation repointed")
+        else:
+            before = current.get(key)
+            after = desired.get(key)
+            parts.append(f"{key}: {_short(before)} -> {_short(after)}")
+    return "; ".join(parts)
+
+
+def _short(value):
+    text = "(empty)" if value in (None, "") else str(value)
+    return text if len(text) <= 40 else text[:37] + "..."
+
+
+def _log_planned_write(page_id, properties, reason):
+    print(f"     [dry-run] WRITE {page_id}  fields={sorted(properties)}  reason={reason}")
+
+
+def sync_jobs_to_notion(jobs, scraped_ok, dry_run=False, rubric_fingerprint=None):
     """Write scored jobs to the Job Postings Notion database, deduped by URL.
 
     - New URL -> create a row, First Seen = today, linked to the matching
       Target List company via the Company relation.
-    - Known URL -> update Score/Reasoning/Routing/Last Seen on the existing
-      row, never duplicate it.
+    - Known URL -> compare every property this pipeline owns against what
+      Notion already holds, and PATCH only the ones that actually moved.
+      A row with nothing new to say costs zero writes.
     - A row whose URL did NOT show up in this run's scrape gets Still Open
       flipped to false (not deleted — the history stays, it's just marked
       closed), but ONLY when its company is in scraped_ok. See the close
@@ -203,9 +545,52 @@ def sync_jobs_to_notion(jobs, scraped_ok, dry_run=False):
 
     scraped_ok comes from run_scrapers() and holds the names of the
     companies whose scrape actually completed this run.
+
+    Why the diff exists
+    -------------------
+    This function used to PATCH all twelve owned properties onto every job
+    on every run. At 3,200 postings that is 3,200 writes, each carrying a
+    0.35s throttle sleep, so the sync alone took about half an hour and
+    grew linearly with the table — while writing byte-identical values to
+    roughly 3,150 of those rows. sync_scrape_status() had already learned
+    this lesson on the Target List; the reasoning just never got carried
+    across to Job Postings.
+
+    The diff compares against Notion's own state, not a local mirror.
+    Every field it needs is read back by _query_all_job_postings() out of
+    the paginated query this function was already running, so the
+    comparison costs no extra request. A local mirror of row state was the
+    obvious alternative and is the wrong answer: it is a second
+    independent record of facts Notion already holds, which is exactly the
+    drift invariant 9 exists to prevent. output/notion_state.json
+    therefore keeps only what Notion cannot answer — see notion/state.py.
+
+    rubric_fingerprint is used for reporting only. A changed rubric means
+    scores genuinely moved and the value comparison will notice on its
+    own; the fingerprint just lets the run say so up front, instead of
+    leaving a reader to wonder why a normally-quiet sync suddenly wrote
+    three thousand rows. Gating score writes on the fingerprint *instead*
+    of on the value would be strictly worse: it would skip a row whose
+    previous write failed, and would never heal a score edited by hand.
     """
     from datetime import date
     today = date.today().isoformat()
+
+    saved_state = state.load()
+    previous_fingerprint = saved_state.get("rubric_fingerprint")
+    if rubric_fingerprint and previous_fingerprint and previous_fingerprint != rubric_fingerprint:
+        print(f"     [rubric] fingerprint changed ({previous_fingerprint} -> "
+              f"{rubric_fingerprint}): scores have been recomputed, so expect this "
+              f"sync to write most rows. That is correct, not a regression.")
+
+    # The date to stamp on a posting that closes this run. The run that
+    # closes a job is by definition the run that did NOT see it, so
+    # stamping today would record the opposite of what Last Seen means;
+    # the previous run is the last one that did see it. Falls back to
+    # today when no previous run is recorded (the first run after this
+    # shipped), which is off by at most one run's interval and corrects
+    # itself immediately afterwards.
+    last_seen_on_close = saved_state.get("last_run") or today
 
     # Target List has to be fetched first now: _query_all_job_postings()
     # needs this map to resolve each row's Company relation to a name,
@@ -218,7 +603,7 @@ def sync_jobs_to_notion(jobs, scraped_ok, dry_run=False):
     existing_by_url = {row["url"]: row for row in existing if row.get("url")}
 
     seen_urls_this_run = set()
-    created, updated, failed = 0, 0, 0
+    created, updated, unchanged, failed = 0, 0, 0, 0
     failed_jobs = []
 
     for job in jobs:
@@ -228,38 +613,44 @@ def sync_jobs_to_notion(jobs, scraped_ok, dry_run=False):
         seen_urls_this_run.add(url)
 
         company_page_id = company_page_by_name.get(job.get("company"))
-        is_new_in_notion = url not in existing_by_url  # Notion's own, authoritative answer —
-        # this is what "New This Run" is now based on, instead of the separate
-        # local seen_jobs.json file. Using two independent sources for the same
+        row = existing_by_url.get(url)
+        # Notion's own, authoritative answer to "is this new" — this is what
+        # "New This Run" is based on, instead of the separate local
+        # seen_jobs.json file. Using two independent sources for the same
         # question let them drift out of sync (e.g. a stale local file marking
         # a job "new" that Notion already has from a prior run), which is
         # exactly what caused the checkbox count to not match the actual
         # created-row count. Notion's own state can't drift from itself.
-        properties = {
-            "title": job.get("title") or "(untitled)",
-            "Score": job.get("score"),
-            "Routing": job.get("routing"),
-            "Reasoning": job.get("reasoning"),
-            "Ambiguity Note": job.get("ambiguity_note") or "",
-            "IC Role": "__YES__" if job.get("ic_role_flag") else "__NO__",
-            "Location": job.get("location") or "",
-            "ATS": job.get("source_ats") or "",
-            "userDefined:URL": url,
-            "date:Last Seen:start": today,
-            "Still Open": "__YES__",
-            "New This Run": "__YES__" if is_new_in_notion else "__NO__",
-        }
-        if company_page_id:
-            properties["Company"] = [company_page_id]
+        is_new_in_notion = row is None
 
         try:
-            if not is_new_in_notion:
-                _update_job_posting(existing_by_url[url]["page_id"], properties, dry_run=dry_run)
-                updated += 1
-            else:
+            if is_new_in_notion:
+                properties = _desired_write_properties(job, company_page_id)
+                properties["userDefined:URL"] = url
                 properties["date:First Seen:start"] = today
+                # Last Seen is written once, here. For a posting that stays
+                # open it is then left alone: "was this still up today" is
+                # what Still Open answers, and re-stamping Last Seen every
+                # run was a full-table write pass buying a value that no
+                # view sorts or filters on. It gets one more update, in the
+                # close pass, at the moment the posting goes away.
+                properties["date:Last Seen:start"] = today
+                properties["Still Open"] = "__YES__"
+                properties["New This Run"] = "__YES__"
+                if dry_run:
+                    _log_planned_write("(create)", properties, f"URL not yet in Notion: {url}")
                 _create_job_posting(properties, dry_run=dry_run)
                 created += 1
+            else:
+                changed = _changed_job_properties(job, row, company_page_id)
+                if not changed:
+                    unchanged += 1
+                    continue
+                if dry_run:
+                    _log_planned_write(row["page_id"], changed,
+                                       _describe_changes(job, row, changed))
+                _update_job_posting(row["page_id"], changed, dry_run=dry_run)
+                updated += 1
         except Exception as e:
             # A single job's write failing (transient Notion outage, rate
             # limit, etc.) should NOT take down the entire sync — and by
@@ -281,6 +672,10 @@ def sync_jobs_to_notion(jobs, scraped_ok, dry_run=False):
     # of re-creating them, and left New This Run off, so they never came
     # back to the active views. Classify first and execute second, so the
     # safety valve below can veto the whole pass before any write goes out.
+    #
+    # This pass is load-bearing for the Scored List view, which filters on
+    # Still Open = true. It is deliberately untouched by the delta work
+    # above: it was already writing only the rows that move.
     to_close = []
     left_open_failed = []
     left_open_unresolved = []
@@ -342,14 +737,26 @@ def sync_jobs_to_notion(jobs, scraped_ok, dry_run=False):
     if not close_aborted:
         for row in to_close:
             try:
-                # Also reset New This Run to false — a job that closes while
-                # still flagged "new" (e.g. it dropped out of scraping before
+                # This is the one place Last Seen is maintained after
+                # creation, and the only moment the pipeline actually
+                # learns something new about it: the posting was there
+                # last run and is not there now.
+                properties = {"Still Open": "__NO__",
+                              "date:Last Seen:start": last_seen_on_close}
+                # Also reset New This Run — a job that closes while still
+                # flagged "new" (e.g. it dropped out of scraping before
                 # ever going through a normal update cycle) would otherwise
                 # stay stuck showing as new forever, since nothing ever
-                # touches a closed job again after this point.
-                _update_job_posting(row["page_id"],
-                                     {"Still Open": "__NO__", "New This Run": "__NO__"},
-                                     dry_run=dry_run)
+                # touches a closed job again after this point. Only when
+                # it is actually set, so a closing row that was never
+                # flagged doesn't carry a redundant property.
+                if row.get("new_this_run"):
+                    properties["New This Run"] = "__NO__"
+                if dry_run:
+                    _log_planned_write(row["page_id"], properties,
+                                       f"closing: URL absent this run, "
+                                       f"{row.get('company')} scraped OK")
+                _update_job_posting(row["page_id"], properties, dry_run=dry_run)
                 closed += 1
             except Exception as e:
                 print(f"     [sync failed] closing {row.get('url')}: {e}")
@@ -362,8 +769,15 @@ def sync_jobs_to_notion(jobs, scraped_ok, dry_run=False):
         print(f"     {len(left_open_unresolved)} job(s) with an unresolved company "
               f"relation left open — check these manually")
 
-    return {"created": created, "updated": updated, "closed": closed,
-            "failed": failed, "failed_jobs": failed_jobs,
+    counts = {"created": created, "updated": updated, "unchanged": unchanged,
+              "closed": closed, "failed": failed}
+    # Written last, and only on a real run: a rehearsal that advanced
+    # last_run would make the next real run stamp closing postings with the
+    # date of a run that never happened.
+    state.save(rubric_fingerprint, counts=counts, dry_run=dry_run)
+
+    return {"created": created, "updated": updated, "unchanged": unchanged,
+            "closed": closed, "failed": failed, "failed_jobs": failed_jobs,
             "left_open": len(left_open_failed),
             "left_open_unresolved": len(left_open_unresolved),
             "close_aborted": close_aborted}
@@ -412,6 +826,7 @@ def _query_all_job_postings(company_name_by_page_id=None):
         payload = {"page_size": 100}
         if cursor:
             payload["start_cursor"] = cursor
+        _count("read:job_postings_page")
         resp = session.post(url, headers=HEADERS, json=payload)
         _raise_with_detail(resp)
         data = resp.json()
@@ -426,6 +841,22 @@ def _query_all_job_postings(company_name_by_page_id=None):
                 "title": _plain_text(props.get("Job Title")),
                 "company_page_id": company_page_id,
                 "company": (company_name_by_page_id or {}).get(company_page_id),
+                # Everything below is here so the sync can diff a row
+                # against what Notion already holds and skip writing when
+                # nothing moved. These come out of the same response as
+                # the fields above, so reading them costs no extra
+                # request — the sync used to rewrite all of them on every
+                # row every run purely because it had never read them
+                # back and so had nothing to compare against.
+                "score": (props.get("Score") or {}).get("number"),
+                "routing": _select_name(props.get("Routing")),
+                "reasoning": _plain_text(props.get("Reasoning")),
+                "ambiguity_note": _plain_text(props.get("Ambiguity Note")),
+                "ic_role": (props.get("IC Role") or {}).get("checkbox", False),
+                "location": _plain_text(props.get("Location")),
+                "ats": _plain_text(props.get("ATS")),
+                "new_this_run": (props.get("New This Run") or {}).get("checkbox", False),
+                "last_seen": _date_start(props.get("Last Seen")),
             })
         if not data.get("has_more"):
             break
@@ -440,6 +871,7 @@ def _query_all_target_list_pages():
         payload = {"page_size": 100}
         if cursor:
             payload["start_cursor"] = cursor
+        _count("read:target_list_page")
         resp = session.post(url, headers=HEADERS, json=payload)
         _raise_with_detail(resp)
         data = resp.json()
@@ -452,6 +884,7 @@ def _query_all_target_list_pages():
 
 
 def _create_job_posting(properties, dry_run=False):
+    _count("write:job_create")
     if dry_run:
         # Must return before the throttle sleep below — a dry run over
         # 1,000+ jobs sleeping 0.35s each for a write that never happens
@@ -467,6 +900,7 @@ def _create_job_posting(properties, dry_run=False):
 
 
 def _update_job_posting(page_id, properties, dry_run=False):
+    _count("write:job_update")
     if dry_run:
         return None
     url = f"{BASE_URL}/pages/{page_id}"
@@ -525,3 +959,23 @@ def _url_value(prop):
     if not prop or prop.get("type") != "url":
         return None
     return prop.get("url") or None
+
+
+def _select_name(prop):
+    """A select that has never been set comes back as
+    {"type": "select", "select": None} rather than as a missing key, so the
+    None check has to happen after the type check rather than instead of it."""
+    if not prop or prop.get("type") != "select":
+        return None
+    selected = prop.get("select")
+    return selected.get("name") if selected else None
+
+
+def _date_start(prop):
+    """Only the start of a date property. Nothing here writes ranges, and if
+    something ever did, an ignored end would compare unequal every run and
+    rewrite the row forever."""
+    if not prop or prop.get("type") != "date":
+        return None
+    value = prop.get("date")
+    return value.get("start") if value else None

@@ -31,6 +31,34 @@ TARGETS = [
 ]
 
 
+class _StubState:
+    """Stands in for notion.state so a test run never reads or writes the
+    real output/notion_state.json. Without this the suite advanced the
+    recorded last_run date to today, and the next REAL run would then stamp
+    every closing posting with the date of a test rather than the date it
+    was last actually seen."""
+
+    def __init__(self):
+        self.saved = []
+
+    def load(self, path=None):
+        return {"version": 1, "rubric_fingerprint": None,
+                "last_run": PREVIOUS_RUN, "last_run_counts": {}}
+
+    def save(self, fingerprint, counts=None, path=None, dry_run=False):
+        if not dry_run:
+            self.saved.append((fingerprint, counts))
+        return None
+
+
+PREVIOUS_RUN = "2026-09-08"
+
+
+def stub_state(module):
+    module.state = _StubState()
+    return module.state
+
+
 def row(pid, url, company_page_id, still_open=True, title="A Role"):
     return {"page_id": pid, "url": url, "still_open": still_open,
             "title": title, "company_page_id": company_page_id}
@@ -69,6 +97,7 @@ def sync(existing_rows, jobs, scraped_ok, dry_run=False):
     nc._query_all_job_postings = lambda lookup=None: [dict(r) for r in rows]
     nc._update_job_posting = fake_update
     nc._create_job_posting = lambda props, dry_run=False: None
+    stub_state(nc)
 
     return nc.sync_jobs_to_notion(jobs, scraped_ok, dry_run=dry_run), closed_ids
 

@@ -1,10 +1,11 @@
 # Job Agent Punch List
 
-19 improvements, ordered by how much each changes the quality of what lands in the
+20 improvements, ordered by how much each changes the quality of what lands in the
 Notion dashboard. Verified against commit `243b2f2` on 2026-08-22. #18 and #19 were
-found 2026-08-23 during a live `--dry-run` and added after the original 17.
+found 2026-08-23 during a live `--dry-run`, and #20 on 2026-09-09 while measuring a
+real run, all added after the original 17.
 
-**As of 2026-08-24: 5 done, 1 resolved as intentional, 2 partial, 11 open.**
+**As of 2026-09-09: 7 done, 1 resolved as intentional, 2 partial, 10 open.**
 Each item carries its own status line with what actually landed.
 
 Severity is damage to the output. Effort is a rough estimate for a Claude-assisted
@@ -18,7 +19,7 @@ priority order, because several items depend on another landing first.
 | 3 | A truncated research reply becomes a permanent "not found" | Critical | 30 m | Open |
 | 4 | Score cache ignores rubric changes | Critical | 30 m | Done |
 | 5 | HTML scraper collapses a company's jobs into one URL | High | 1–2 h | Open |
-| 6 | Two rubric copies, already out of sync | High | 30 m | Open |
+| 6 | Two rubric copies, already out of sync | High | 30 m | Done |
 | 7 | No retry or rate-limit handling anywhere | High | 2 h | Done (partial) |
 | 8 | Prompt caching probably isn't firing | High | 45 m | Open |
 | 9 | Two sources of truth for "new this run" | High | 30 m | Partial |
@@ -32,6 +33,7 @@ priority order, because several items depend on another landing first.
 | 17 | No run summary, no cost visibility, no tests | Low | 2–3 h | Partial |
 | 18 | Windows console encoding crashes the run on unrenderable characters | High | 5 m | Done |
 | 19 | Embedded ATS boards are undetectable | Critical | 1–2 h | Open |
+| 20 | Notion sync rewrites every row every run | Critical | 3 h | Done |
 
 ---
 
@@ -247,6 +249,27 @@ Affects the ~90 companies with no real ATS.
 ## 6. Two rubric copies, already drifted
 **High** · `scoring/rubric.md`, Claude Project doc "Scoring Rubric"
 
+**Status: done, 2026-09-09.** Fix option 1 as landed: `scoring/rubric.md` is the
+authoritative copy and the only one the code reads, and the Claude Project doc is now a
+stamped read-only mirror of it rather than a second editable original. The drift that
+motivated this item is gone — the Project copy has been synced, so Head of Product is
+no longer missing from it. The convention going forward is to edit the repo copy and
+re-stamp the Project copy from it; a Project-side edit is not a rubric change, because
+nothing reads it.
+
+Option 2 (fetch the rubric from Notion at run start, so editing it in Notion changes
+behavior) was **not** done and is not queued. It only becomes worth the complexity once
+runs are scheduled and nobody is at a checkout to edit the file — and it would make the
+rubric a network dependency of every run, which #4's fingerprint would then have to
+absorb on the fly. Revisit with #14.
+
+Option 3 is already covered elsewhere: `score_all()` prints
+`[score] rubric fingerprint: <hash>` at step 7, before it spends anything, and says how
+many jobs a fingerprint change is about to re-score (that came with #4). #20 then passes
+the same value into the sync so a mass write can be explained rather than merely
+observed. It prints at step 7 rather than at the very top of the run, which is early
+enough for both purposes.
+
 `scoring/rubric.md` lists **Head of Product**. The Project doc does not. The code reads
 the file, so the file wins today, but reasoning from the Project copy will mislead.
 
@@ -447,8 +470,9 @@ A rubric decision, not a bug.
 
 **Fix**
 1. Add a `"Low fit"` routing value for scores 1–2.
-2. Update `_enforce_routing()`, the rubric's routing summary (both copies until #6),
-   the Notion Routing select options, and the Excel tabs together.
+2. Update `_enforce_routing()`, the rubric's routing summary (the repo copy; the
+   Project mirror gets re-stamped from it — see #6), the Notion Routing select
+   options, and the Excel tabs together.
 3. The rubric header says "score 1-5" but the guide defines a 0. Say 0–5.
 
 ## 17. No run summary, no cost visibility, no tests
@@ -558,6 +582,83 @@ motivated writing it down just doesn't hold up as verified evidence for it.
 
 ---
 
+## 20. The Notion sync rewrote every row every run
+**Critical** · `notion/client.py`, `notion/state.py`, `run.py`
+
+**Done, 2026-09-09.**
+
+Measured on a real run at 3,229 postings, with per-step wall clock added to
+`main()` and request counters in `notion/client.py`:
+
+| Step | Wall clock | Share |
+| --- | --- | --- |
+| 8 `sync_jobs_to_notion` | 2420.9 s | **80.3%** |
+| 4 `run_scrapers` | 511.9 s | 17.0% |
+| 7 `score_all` | 57.5 s | 1.9% |
+| everything else | 24.2 s | 0.8% |
+| **Total** | **3014.5 s (50 min)** | |
+
+3,273 writes against 62 reads. Scoring was never the problem: it is cached, and
+only 57 of 3,229 jobs needed an API call.
+
+The cause was not a stray second pass. `sync_jobs_to_notion` built a full
+twelve-property dict for every job and PATCHed it unconditionally — the
+"New This Run" reset was field #12 of that same write, not a separate pass. It
+*could not* have compared: `_query_all_job_postings()` only read back `page_id`,
+`url`, `still_open`, `title` and the Company relation, so the values needed for a
+diff were never fetched. Roughly 3,150 of those writes were byte-identical.
+
+`sync_scrape_status()` had already solved this on the Target List and says so in
+its docstring; the reasoning just never crossed over to Job Postings.
+
+**Fix, as landed**
+1. `_query_all_job_postings()` also reads back Score, Routing, Reasoning, Ambiguity
+   Note, IC Role, Location, ATS, New This Run and Last Seen — out of the same
+   paginated response, so no extra request.
+2. `_changed_job_properties()` compares each owned property and returns only what
+   moved. An unchanged row is not written at all.
+3. `Last Seen` is written at creation and at close, never in between. The close
+   stamp is the *previous* run's date (from `notion_state.json`), because the run
+   that closes a posting is the run that did not see it.
+4. `New This Run` is cleared only where Notion says the box is actually ticked —
+   in a steady state, last run's creations and nothing else.
+5. `output/notion_state.json` (`notion/state.py`) holds only the rubric fingerprint
+   and the previous run's date. It is deliberately **not** a mirror of row state:
+   that would be a second independent record of facts Notion already holds, which is
+   the drift invariant 9 exists to prevent. The diff runs against Notion's own state.
+6. The fingerprint is reporting only. A rubric change moves scores, and the value
+   comparison notices that by itself; the fingerprint just lets the run explain a mass
+   write before it happens. Gating on it *instead* of on the value would skip rows
+   whose previous write failed and would never heal a hand-edited score.
+
+Close-pass behaviour and the 25% safety valve are untouched — that pass was already
+writing only rows that move, and the Scored List view filters on `Still Open`, so it
+is load-bearing.
+
+**The bug the delta pass exposed.** The first dry run after the change planned 803
+writes, not the ~150 expected. 745 of them were the same field on different rows, and
+the dry-run reason said why: `Routing: Needs Review -> Needs review`. Notion matches a
+select name against its existing options case-insensitively, stores its own canonical
+casing, and returns that on read. The pipeline emits `"Needs review"`; the option in
+the database is named `"Needs Review"`. Every write was accepted and every read came
+back different from what was asked for, so that field could never compare equal.
+
+Fixed in the comparison (`_selects_equal`), deliberately not in the scorer:
+`output_excel.py` filters its Needs Review tab on the scorer's literal, so
+"correcting" the emitted string to match Notion would have silently emptied that tab.
+
+Worth noting this was invisible before the delta pass — the old code rewrote every row
+unconditionally, so a field that never compared equal cost nothing extra and left no
+trace. It only became a bug worth finding once comparison started mattering.
+
+`tests/test_delta_sync.py` (17 tests) covers the saving and, mostly, the failure mode
+that replaces it: a comparison that can never be equal rewrites its row forever while
+the sync still reports success. See invariants 12–15.
+
+Deliberately **not** done here: concurrency. Cutting the wasted writes first was the
+agreement; whether #13 is still worth doing is now a separate question against a much
+smaller step 8.
+
 ## Suggested batching
 
 One branch and one PR per batch. This order is not the priority order.
@@ -566,7 +667,7 @@ One branch and one PR per batch. This order is not the priority order.
 |---|---|---|
 | 1 | **#4, then #1** | Fingerprint first, so the description change actually forces a re-score. #1 alone leaves every existing job frozen on its title-only score. |
 | 2 | **#7, then #2 and #3** | Retries first. #2 and #3 are the same problem in two places: telling a transient failure apart from a real answer. Run #3's recovery pass at the end. |
-| 3 | **#6, #9, #10, #12, #16** | All small, independent, cleanup. One sitting. |
+| 3 | **#6 (done), #9, #10, #12, #16** | All small, independent, cleanup. One sitting. |
 | 4 | **#14, #13, #17** | Cache persistence, run time, observability. Do these *before* the first scheduled run. |
 | 5 | **#5, #8, #11, #15** | #5 is the biggest coverage win left and the most open-ended. |
 
