@@ -701,6 +701,10 @@ def main():
           f"{sync_result['created']} created, {sync_result['updated']} updated, "
           f"{sync_result['unchanged']} unchanged (not written), "
           f"{sync_result['closed']} marked closed (no longer posted)")
+    if sync_result.get("date_applied_backfilled"):
+        print(f"{'[dry-run] would stamp' if dry_run else 'Stamped'} Date Applied on "
+              f"{sync_result['date_applied_backfilled']} posting(s) marked Applied "
+              f"in Notion with no date yet")
     if sync_result.get("close_aborted"):
         print("[warn] the close pass was aborted by the 25% safety valve — see above. "
               "Nothing was closed; investigate the scrape failures before the next run.")

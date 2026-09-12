@@ -100,12 +100,12 @@ def sync(existing_rows, jobs, scraped_ok=frozenset({ACME}), dry_run=False):
     """
     writes, creates = [], []
 
-    def fake_update(page_id, props, dry_run=False):
+    def fake_update(page_id, props, icon_url=None, dry_run=False):
         if dry_run:
             return None       # mirrors the real helper: returns before the network
         writes.append((page_id, props))
 
-    def fake_create(props, dry_run=False):
+    def fake_create(props, icon_url=None, dry_run=False):
         if dry_run:
             return None
         creates.append(props)

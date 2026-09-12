@@ -663,9 +663,24 @@ def sync_jobs_to_notion(jobs, scraped_ok, dry_run=False, rubric_fingerprint=None
     company_pages = _query_all_target_list_pages()
     company_page_by_name = {row["company"]: row["page_id"] for row in company_pages}
     company_name_by_page_id = {row["page_id"]: row["company"] for row in company_pages}
+    # Lets both branches below copy a company's own page icon onto its job
+    # postings — Job Postings has no icon-setting logic of its own, so
+    # without this every row stays blank forever. Only companies with a
+    # real external icon (a resolved favicon) show up here.
+    company_icon_by_page_id = {row["page_id"]: row["icon_url"]
+                                for row in company_pages if row.get("icon_url")}
 
     existing = _query_all_job_postings(company_name_by_page_id)
     existing_by_url = {row["url"]: row for row in existing if row.get("url")}
+
+    # Application Status is set by hand in Notion; a real "stamp the date
+    # the moment the status changes" automation needs a paid Notion plan
+    # (see punch list), so this is the free substitute. Runs against every
+    # row Notion currently holds, not just this run's scrape, so it still
+    # catches a posting marked Applied after it has already closed and
+    # stopped showing up here, which the create/update loop below would
+    # otherwise never revisit.
+    date_applied_backfilled = _backfill_applied_dates(existing, today, dry_run=dry_run)
 
     seen_urls_this_run = set()
     created, updated, unchanged, failed = 0, 0, 0, 0
@@ -702,19 +717,26 @@ def sync_jobs_to_notion(jobs, scraped_ok, dry_run=False, rubric_fingerprint=None
                 properties["date:Last Seen:start"] = today
                 properties["Still Open"] = "__YES__"
                 properties["New This Run"] = "__YES__"
+                icon_url = company_icon_by_page_id.get(company_page_id)
                 if dry_run:
                     _log_planned_write("(create)", properties, f"URL not yet in Notion: {url}")
-                _create_job_posting(properties, dry_run=dry_run)
+                _create_job_posting(properties, icon_url=icon_url, dry_run=dry_run)
                 created += 1
             else:
                 changed = _changed_job_properties(job, row, company_page_id)
-                if not changed:
+                # Backfill: an existing row with no icon yet gets one copied
+                # over from its company, even on a run where nothing else
+                # about it changed — otherwise every job created before this
+                # was added stays blank forever, since it'll never hit the
+                # create branch again.
+                icon_url = None if row.get("has_icon") else company_icon_by_page_id.get(company_page_id)
+                if not changed and not icon_url:
                     unchanged += 1
                     continue
                 if dry_run:
                     _log_planned_write(row["page_id"], changed,
                                        _describe_changes(job, row, changed))
-                _update_job_posting(row["page_id"], changed, dry_run=dry_run)
+                _update_job_posting(row["page_id"], changed, icon_url=icon_url, dry_run=dry_run)
                 updated += 1
         except Exception as e:
             # A single job's write failing (transient Notion outage, rate
@@ -845,7 +867,8 @@ def sync_jobs_to_notion(jobs, scraped_ok, dry_run=False, rubric_fingerprint=None
             "closed": closed, "failed": failed, "failed_jobs": failed_jobs,
             "left_open": len(left_open_failed),
             "left_open_unresolved": len(left_open_unresolved),
-            "close_aborted": close_aborted}
+            "close_aborted": close_aborted,
+            "date_applied_backfilled": date_applied_backfilled}
 
 
 def _print_close_candidates(to_close, left_open_failed, left_open_unresolved):
@@ -906,6 +929,7 @@ def _query_all_job_postings(company_name_by_page_id=None):
                 "title": _plain_text(props.get("Job Title")),
                 "company_page_id": company_page_id,
                 "company": (company_name_by_page_id or {}).get(company_page_id),
+                "has_icon": page.get("icon") is not None,
                 # Everything below is here so the sync can diff a row
                 # against what Notion already holds and skip writing when
                 # nothing moved. These come out of the same response as
@@ -922,11 +946,46 @@ def _query_all_job_postings(company_name_by_page_id=None):
                 "ats": _plain_text(props.get("ATS")),
                 "new_this_run": (props.get("New This Run") or {}).get("checkbox", False),
                 "last_seen": _date_start(props.get("Last Seen")),
+                "application_status": _select_name(props.get("Application Status")),
+                "date_applied": _date_start(props.get("Date Applied")),
             })
         if not data.get("has_more"):
             break
         cursor = data["next_cursor"]
     return rows
+
+
+def _backfill_applied_dates(existing_rows, today, dry_run=False):
+    """Application Status is set by hand in Notion. Stamping Date Applied
+    the instant that happens is a real Notion database automation, but
+    those need a paid Notion plan — this is the free substitute. Once a
+    run notices Application Status = "Applied" with Date Applied still
+    blank, it fills in today's date.
+
+    Runs against every row Notion currently holds (existing_rows, from
+    _query_all_job_postings), not just this run's scrape — so it still
+    catches a posting marked Applied after it has already closed and
+    stopped showing up in the scrape, which the main create/update loop
+    above would otherwise never revisit.
+
+    Only ever fills a blank Date Applied. A row already carrying a date —
+    whether typed in by hand or stamped by a previous run — is left
+    alone, and no other Application Status value is touched."""
+    backfilled = 0
+    for row in existing_rows:
+        if row.get("application_status") != "Applied" or row.get("date_applied"):
+            continue
+        if dry_run:
+            print(f"     [backfill] [dry-run] would stamp Date Applied={today} on "
+                  f"{row.get('company')} — {row.get('title')}")
+            backfilled += 1
+            continue
+        try:
+            _update_job_posting(row["page_id"], {"date:Date Applied:start": today})
+            backfilled += 1
+        except Exception as e:
+            print(f"     [backfill failed] {row.get('company')} — {row.get('title')}: {e}")
+    return backfilled
 
 
 def _query_all_target_list_pages():
@@ -941,14 +1000,27 @@ def _query_all_target_list_pages():
         _raise_with_detail(resp)
         data = resp.json()
         for page in data["results"]:
-            rows.append({"page_id": page["id"], "company": _plain_text(page["properties"].get("Company"))})
+            # icon_url carries the company's own page icon (set by
+            # update_company_website()'s favicon stamp) so callers can copy
+            # it onto related rows elsewhere — e.g. Job Postings, which has
+            # no icon-setting logic of its own. Only "external" icons have a
+            # copyable URL; an emoji icon (like BLANK_ICON) or a Notion-
+            # hosted "file" icon yields None here and is simply skipped by
+            # the caller.
+            icon = page.get("icon")
+            icon_url = icon["external"]["url"] if icon and icon.get("type") == "external" else None
+            rows.append({
+                "page_id": page["id"],
+                "company": _plain_text(page["properties"].get("Company")),
+                "icon_url": icon_url,
+            })
         if not data.get("has_more"):
             break
         cursor = data["next_cursor"]
     return rows
 
 
-def _create_job_posting(properties, dry_run=False):
+def _create_job_posting(properties, icon_url=None, dry_run=False):
     _count("write:job_create")
     if dry_run:
         # Must return before the throttle sleep below — a dry run over
@@ -958,18 +1030,22 @@ def _create_job_posting(properties, dry_run=False):
     url = f"{BASE_URL}/pages"
     payload = {"parent": {"database_id": JOB_POSTINGS_DATABASE_ID},
                "properties": _build_job_properties(properties)}
+    if icon_url:
+        payload["icon"] = {"type": "external", "external": {"url": icon_url}}
     resp = session.post(url, headers=HEADERS, json=payload)
     _raise_with_detail(resp)
     time.sleep(0.35)  # stay under Notion's ~3 req/s limit instead of retrying 429s after the fact
     return resp.json()
 
 
-def _update_job_posting(page_id, properties, dry_run=False):
+def _update_job_posting(page_id, properties, icon_url=None, dry_run=False):
     _count("write:job_update")
     if dry_run:
         return None
     url = f"{BASE_URL}/pages/{page_id}"
     payload = {"properties": _build_job_properties(properties)}
+    if icon_url:
+        payload["icon"] = {"type": "external", "external": {"url": icon_url}}
     resp = session.patch(url, headers=HEADERS, json=payload)
     _raise_with_detail(resp)
     time.sleep(0.35)
