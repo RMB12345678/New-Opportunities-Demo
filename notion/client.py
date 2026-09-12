@@ -674,8 +674,9 @@ def sync_jobs_to_notion(jobs, scraped_ok, dry_run=False, rubric_fingerprint=None
     existing_by_url = {row["url"]: row for row in existing if row.get("url")}
 
     # Application Status is set by hand in Notion; a real "stamp the date
-    # the moment the status changes" automation needs a paid Notion plan
-    # (see punch list), so this is the free substitute. Runs against every
+    # the moment the status changes" automation is a Notion database
+    # automation and needs a paid plan, so this is the free substitute:
+    # it lands on the next run rather than instantly. Runs against every
     # row Notion currently holds, not just this run's scrape, so it still
     # catches a posting marked Applied after it has already closed and
     # stopped showing up here, which the create/update loop below would

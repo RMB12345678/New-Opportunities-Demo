@@ -114,10 +114,16 @@ Listed for pattern-matching if similar symptoms reappear.
 - **Genuinely ambiguous company names** — Signals Group, BioHope Scientific, Montagu,
   Ortivity. No confirmed ATS or careers page, all still No Scraper. Not necessarily
   wrong, just unresolved.
-- **No outcome feedback loop.** Date Applied and Application Notes exist on Job
-  Postings, but nothing uses that data to recalibrate the rubric. This is the planned
-  "closed loop" phase, and it is explicitly human-reviewed recalibration rather than
-  automated retraining, given realistic data volume.
+- **No outcome feedback loop.** Application Status, Date Applied and Application Notes
+  exist on Job Postings, and as of Sep 11 the sync stamps `Date Applied` automatically
+  once a row is hand-marked Applied — but nothing yet uses that data to recalibrate the
+  rubric. This is the planned "closed loop" phase, and it is explicitly human-reviewed
+  recalibration rather than automated retraining, given realistic data volume.
+- **Application tracking is half-manual by budget, not by design.** Setting
+  `Application Status` when a posting changes hands is a human step, and stamping the
+  date the moment it changes would be a Notion database automation, which needs a paid
+  plan. `_backfill_applied_dates()` closes the second half of that gap on the next run
+  instead of instantly; the first half stays manual.
 
 ## Roadmap
 
@@ -129,6 +135,12 @@ Listed for pattern-matching if similar symptoms reappear.
 
 ## Changelog
 
+- **Sep 11, 2026** — Job Postings rows now inherit their company's page icon, copied
+  from the Target List row during the sync and backfilled onto existing rows that have
+  none (invariant 17 in `CLAUDE.md`). Added `_backfill_applied_dates()`, which stamps
+  `Date Applied` on any row hand-marked `Application Status` = Applied with the date
+  still blank, over every row Notion holds rather than just this run's scrape
+  (invariant 18). Both honour `--dry-run`.
 - **Sep 10, 2026** — Added a `Website` property to the Target List plus a pipeline step,
   `fill_missing_website()`, that derives it (free extraction from the Careers URL first,
   an Anthropic homepage search only if that fails) and stamps the page icon with a real

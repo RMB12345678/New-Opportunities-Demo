@@ -82,7 +82,9 @@ you will trust it.
 9. `sync_jobs_to_notion(jobs, scraped_ok)` — dedup by URL, create/update, close what's
    genuinely gone. **Delta-only**: every owned property is compared against what Notion
    already holds and only differences are written. A steady-state run writes ~100 rows,
-   not ~3,200.
+   not ~3,200. Two things ride along with the same pass: each posting inherits its
+   company's page icon (invariant 17), and `_backfill_applied_dates()` stamps
+   `Date Applied` on rows hand-marked `Application Status` = Applied (invariant 18).
 10. `build_workbook()` — five-tab Excel export.
 
 ## Invariants
@@ -131,6 +133,9 @@ real failure, so preserve them unless the task explicitly says otherwise.
     differences is not written at all. Rewriting all of them unconditionally is what
     made the sync 80% of the run at 3,200 rows. Any new field the sync writes has to
     be read back and compared too, or it silently reintroduces a full-table write.
+    The page icon is not a property and so isn't part of the property diff, but it
+    obeys the same rule by a different mechanism — read back per row as `has_icon`,
+    written only where absent. See invariant 17.
 13. **A comparison that can never be equal is worse than no comparison.** It rewrites
     its row every run while the sync still reports success, so the saving evaporates
     with nothing to show it. Four real traps, all covered by tests in
@@ -166,6 +171,28 @@ real failure, so preserve them unless the task explicitly says otherwise.
     "nothing found" — so `get_companies_missing_website()` filters on "no icon yet", not
     "no Website yet". A row a human iconed by hand for an unrelated reason will look
     already-checked and won't be retried; accepted trade-off, not a bug.
+17. **A job posting's icon is copied from its company, never derived.** Job Postings
+    has no icon logic of its own, so a row stays blank forever unless the sync copies
+    one across from the related Target List row. Only an `external` company icon
+    carries a URL that can be copied — the emoji `BLANK_ICON` a genuine "no website
+    found" leaves behind (invariant 16) and a Notion-hosted `file` icon both read back
+    as `None` and are skipped rather than guessed at. This is deliberately the one
+    write that happens with an empty property diff: a row whose `has_icon` is false is
+    written even when nothing else about it moved, because it will never reach the
+    create branch again. The cost is bounded — each row is iconed once — but the first
+    run after this landed, and any run after a batch of companies gains favicons, will
+    report an `updated` count far above the usual steady state. That is the backfill,
+    not a regression of invariant 12.
+18. **`Date Applied` is only ever stamped onto a blank.** `Application Status` is
+    maintained by hand; stamping the date the instant it changes is a Notion database
+    automation, which needs a paid plan, so `_backfill_applied_dates()` is the free
+    substitute. It writes today's date only where `Application Status` is `Applied`
+    **and** `Date Applied` is empty. A date already present — typed by hand or stamped
+    by an earlier run — is never overwritten, which is invariant 3's rule applied to a
+    field the pipeline half-owns, and no other status value is touched. It runs over
+    every row `_query_all_job_postings()` returned rather than over this run's scrape,
+    so it still reaches a posting marked Applied after it closed and stopped being
+    scraped; the create/update loop never revisits those.
 
 ## Traps
 
@@ -183,6 +210,15 @@ real failure, so preserve them unless the task explicitly says otherwise.
   anywhere outside the repo — a doc, a wiki, a chat project — that copy is a read-only
   mirror of this file, not a second original: edit the repo copy and re-stamp the other
   from it. An edit to the copy changes no behavior.
+- **`Application Status` is read by the pipeline and written by nobody.** It is the
+  one Job Postings property a human owns outright, and `_backfill_applied_dates()`
+  matches its value against the exact string `"Applied"`. Notion matches select names
+  case-insensitively but returns its own casing (invariant 13), so renaming the option
+  or re-spelling it — `applied`, `Applied ✅` — makes the backfill quietly stop finding
+  anything. It will report `0` stamped, which is indistinguishable from "nothing to
+  stamp". If the count is 0 on a run where a row was definitely marked Applied, check
+  the option's spelling in Notion before looking at the code.
+
 - **`scoring/excluded_title_keywords.json` matches on substring**, deliberately. A new
   entry catches every title containing the word, management roles included.
 - Repo is on Windows, Python 3.14, where stdout defaults to cp1252. `run.py`
@@ -209,7 +245,12 @@ sorted by Failing Since ascending — the oldest breakage first).
 Target List), Score (number), Routing (select: Scored / Needs Review / Non-fit),
 Reasoning (text), Ambiguity Note (text), IC Role (checkbox), Location (text), URL (url),
 ATS (text), First Seen (date), Last Seen (date), Still Open (checkbox), New This Run
-(checkbox), Date Applied (date), Application Notes (text), Application Summary (formula).
+(checkbox), Application Status (select — hand-maintained, see invariant 18), Date
+Applied (date), Application Notes (text), Application Summary (formula).
+
+The Job Postings page **icon** is pipeline-written but not pipeline-derived: it is a
+copy of the related Target List row's icon, and only when that icon is an `external`
+one. See invariant 17.
 
 Views on Job Postings (five):
 
