@@ -104,6 +104,22 @@ Listed for pattern-matching if similar symptoms reappear.
   sorted by `Failing Since` so the oldest breakage is first. Punch list #5 and #19
   cover the code side; the headless-browser question for JavaScript-rendered job
   lists is still open.
+
+  Sep 21 (#21) took 25 companies out of that bucket. It also showed the "no scraper"
+  count was the *optimistic* reading of the gap: 15 of those 25 were not in Needs
+  Manual Check at all, but stamped `OK` with `HTML: 0 job(s)` — the generic HTML
+  scraper reporting a confident zero against a live board. A false `OK` is worse than
+  a `No Scraper`, because nothing surfaces it. How many of the remaining `OK — 0`
+  companies are the same thing is not yet known and is worth measuring before more
+  scrapers are written.
+
+- **A third of the database is outside the careers-URL backfill.** 162 of 470 rows
+  carry a `"Not found"` ATS value, and `get_companies_missing_url()` excludes all of
+  them by design — re-searching a URL for a company already answered conclusively is
+  waste. 36 of those read `"Not found (auto-search failed)"` exactly, which punch list
+  #3 argues may be truncated replies rather than real answers. Until #3's recovery step
+  runs, those rows cannot be repaired by any pass. This is the reason the #22 fix helps
+  fewer rows than the raw count of bad URLs suggests.
 - **Arbital Health** — ATS field still says "Greenhouse and/or Lever (ambiguous)" and
   defaults to Greenhouse. On the Sep 9 run it scraped without error and returned zero
   postings, so the ambiguity is unresolved but not currently failing.
@@ -135,6 +151,17 @@ Listed for pattern-matching if similar symptoms reappear.
 
 ## Changelog
 
+- **Sep 21, 2026** — Audited all 470 `ATS Platform` values against `resolve_scraper()`
+  and added the seven scrapers the audit called for (#21): Workable, Personio, Breezy,
+  Rippling, Teamtailor, SmartRecruiters, Pinpoint — 25 companies, **106 postings** that
+  the pipeline could not previously see. 15 of those companies had been reporting
+  `OK — HTML: 0 job(s)`, a confident wrong zero, rather than showing up in Needs Manual
+  Check at all. The audit then exposed a data-integrity gap (#22): 20 rows held a pasted
+  Notion document link in `Careers URL`, which — being non-blank — made them permanently
+  invisible to the careers-URL backfill while the scrape failed on them every run, and
+  which had already propagated into `Website` for 18 of them. Both selectors now test
+  the value, not just its presence; the 20 bad URLs were cleared with a one-off pass.
+  New invariants 19 and 20.
 - **Sep 11, 2026** — Job Postings rows now inherit their company's page icon, copied
   from the Target List row during the sync and backfilled onto existing rows that have
   none (invariant 17 in `CLAUDE.md`). Added `_backfill_applied_dates()`, which stamps

@@ -316,7 +316,7 @@ Two consequences worth keeping in mind before changing the sync:
 
 ## Current work
 
-`docs/punch-list.md` holds 20 prioritized improvements with fix-level detail, a status
+`docs/punch-list.md` holds 22 prioritized improvements with fix-level detail, a status
 line per item, and a suggested batching order at the bottom. Work one batch per branch.
 `docs/project-status.md` has the longer history, including bugs already fixed and open
 issues.

@@ -34,6 +34,8 @@ priority order, because several items depend on another landing first.
 | 18 | Windows console encoding crashes the run on unrenderable characters | High | 5 m | Done |
 | 19 | Embedded ATS boards are undetectable | Critical | 1–2 h | Open |
 | 20 | Notion sync rewrites every row every run | Critical | 3 h | Done |
+| 21 | Named ATS platforms with no scraper | High | 3-4 h | Done |
+| 22 | A wrong saved value is indistinguishable from a researched one | High | 1-2 h | Partial |
 
 ---
 
@@ -163,6 +165,15 @@ Worse, `get_companies_missing_url()` excludes any company whose ATS contains "No
 found", so the company also loses its careers-URL backfill and leaves the pipeline.
 
 The status doc counts ~90 companies with no ATS found. Some share may be truncation.
+
+**Measured 2026-09-21** (while auditing ATS coverage for #21): **36** rows read
+`"Not found (auto-search failed)"` exactly — that is step 5's recovery target, and
+every one of them is a company a truncated reply may have written off. More
+broadly, **162 of 470** rows carry a `"Not found"` ATS value of some kind, and all
+162 are excluded from the careers-URL backfill by the rule quoted above. That is a
+third of the database sitting outside the one pass that could repair it, which is
+what makes step 5 worth more than its size suggests. #22 widened the same
+selector's *other* condition and deliberately did not touch this one.
 
 **Fix**
 1. Check the stop reason and raise, so it lands in the existing retry path:
@@ -658,6 +669,88 @@ the sync still reports success. See invariants 12–15.
 Deliberately **not** done here: concurrency. Cutting the wasted writes first was the
 agreement; whether #13 is still worth doing is now a separate question against a much
 smaller step 8.
+
+## 21. Named ATS platforms with no scraper
+**High** · `run.py` → `SCRAPERS`, `SLUG_URL_PATTERNS`, `scrapers/*.py`
+
+**Done, 2026-09-21.**
+
+An audit of all 470 `ATS Platform` values against `resolve_scraper()` found 25
+companies whose ATS named a real platform nothing handled. The failure was
+invisible in both directions: rows marked `API` got no scrape attempt at all and
+showed as `No Scraper`, while rows marked `HTML` fell through to
+`scrapers/html_generic.py` and were stamped `OK` with `HTML: 0 job(s)` — a
+confident, wrong zero. ARCHIMED read `OK — 0` against a board of 23.
+
+Seven scrapers added: Workable (12 companies), Personio (4), Breezy (3),
+Rippling (2), Teamtailor (2), SmartRecruiters (1), Pinpoint (1). Live against
+the real boards these return **106 postings** that were previously invisible.
+Every endpoint was confirmed against the actual company boards rather than
+assumed. Platforms with no usable public endpoint — iCIMS, Comeet, Jobvite,
+Homerun, Paylocity, JazzHR, Polymer — were deliberately left alone rather than
+guessed at.
+
+Two did not fit the shape the other scrapers share, and both are recorded as
+invariants rather than comments because the next scraper will meet them again:
+Teamtailor's slug is a whole hostname (its customers run on their own domains),
+and Personio answers a missing tenant with a 307 to its own marketing site
+rather than a 404 — which the shared retry session then retried five times with
+backoff against a site that never had the answer. See invariant 19.
+
+**Left open**
+- **BambooHR and Recruitee** (Proscia, Ibex) both look to have usable public
+  endpoints, but neither could be tested: their saved Careers URL was the
+  placeholder #22 is about, so no slug was knowable. Cheap to verify once the
+  backfill saves real URLs for those two.
+- **Two rows have contradictory data**, left for a human because ATS Platform is
+  a researched fact (invariant 3): CoMind is tagged Personio but its Careers URL
+  is an Ashby board holding 9 live roles, and Shockwave Medical is tagged
+  `J&J Careers site` with a Workable URL. One field edit each.
+- Three companies still fail honestly — a dead board (BrainsWay) and two whose
+  real board URL is unknown (SimBioSys, Owlstone Medical). They surface in Needs
+  Manual Check with a note naming the cause.
+
+## 22. A wrong saved value is indistinguishable from a researched one
+**High** · `notion/client.py` → `get_companies_missing_url()`,
+`get_companies_missing_website()`; `ats_finder/careers_url.py`
+
+**Partial, 2026-09-21.** Fixed for `Careers URL` and `Website`; the same
+weakness in `ATS Platform`, `Sector / Focus` and `HQ` is untouched.
+
+Invariant 8 makes a blank field mean "never researched", so every outcome writes
+something non-blank. That is a sound test for a field whose wrong answers are
+still *answers*, and no test at all for one holding something that was never an
+answer. 20 rows carried the same pasted Notion document link in `Careers URL`.
+Being non-blank, `get_companies_missing_url()` skipped them on every run while
+the scrape retried and failed on every run — the one pass that could repair them
+was the one pass that never looked.
+
+It had already propagated. `derive_website()` reads the Careers URL, so 18 of
+those rows had `Website` set to `https://app.notion.com` and their page icon
+stamped from it, which invariant 16 reads as "already checked" — making the
+wrong value permanent. Root cause there was a single omission: `NON_COMPANY_HOSTS`
+listed `notion.so` and `notion.site` but not `notion.com`.
+
+Both selectors now test the value rather than its presence. The bar is
+structural impossibility, not suspicion, because acting on a rejection means
+overwriting: the deliberate Google-search fallback and a merely stale URL both
+still pass. See invariant 20 for the two constraints that must hold if the host
+lists are ever widened.
+
+The audit also surfaced a second bad-value shape the fix now catches: **88 rows**
+hold a bare `"www.google.com"` — no scheme, no query, unusable by any scraper
+(`requests` raises `MissingSchema`). 73 of those are excluded anyway by the
+`"Not found"` ATS rule in #3; 15 are now repairable.
+
+**Left open**
+1. The same reasoning applies to `ATS Platform`, `Sector / Focus` and `HQ`, which
+   still use the presence test. No demonstrated failure yet, so this was
+   deliberately not widened on speculation — but a row whose ATS Platform is a
+   whole sentence (Hocoma's is) is the same bug wearing a different field.
+2. A cheap liveness check is **not** the fix and should not be bolted on here:
+   invariant 1 means a fetch that fails to run is not evidence the URL is wrong,
+   and a 404 is already a scrape failure the Needs Manual Check view surfaces.
+   If it is ever wanted, it belongs beside #5/#19 as scrape-side work.
 
 ## Suggested batching
 
