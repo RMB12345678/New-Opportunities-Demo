@@ -71,10 +71,17 @@ you will trust it.
    possible, an Anthropic homepage lookup otherwise; stamps the page icon with a real
    favicon logo or a blank-square marker either way. See
    `ats_finder/find_website.py` and invariant 16.
-5. `run_scrapers()` — Greenhouse/Lever/Ashby/Workday via their public APIs; everything
-   else marked HTML gets `scrapers/html_generic.py`. Returns `(jobs, scraped_ok, statuses)`.
+5. `run_scrapers()` — eleven platforms via their public APIs (Greenhouse, Lever,
+   Ashby, Workday, Workable, Personio, Breezy, Rippling, Teamtailor, SmartRecruiters,
+   Pinpoint); everything else marked HTML gets `scrapers/html_generic.py`. Returns
+   `(jobs, scraped_ok, statuses)`.
    Workday takes its own branch: its board needs four parameters rather than one slug,
    and it deliberately has no guess-from-the-company-name fallback.
+   Two of the newer ones are not shaped like the rest. Teamtailor's "slug" is a whole
+   hostname, because its customers run on their own domains rather than a shared vendor
+   path. Personio answers a missing tenant with a 307 to the vendor's marketing site
+   rather than a 404, so `scrapers/personio.py` does not follow redirects — see
+   invariant 19.
 6. `sync_scrape_status(statuses)` — stamps every Target List row with how its scrape
    went. Anything not `OK` is what the Needs Manual Check view shows.
 7. `mark_new_postings()` — flags first-seen postings against `output/seen_jobs.json`.
@@ -193,6 +200,17 @@ real failure, so preserve them unless the task explicitly says otherwise.
     every row `_query_all_job_postings()` returned rather than over this run's scrape,
     so it still reaches a posting marked Applied after it closed and stopped being
     scraped; the create/update loop never revisits those.
+
+19. **A "board not found" that answers with a redirect must not be followed.** Most
+    boards 404 an unknown slug. Personio instead answers 307 with
+    `Location: https://personio.com` — the vendor's *marketing site*, which answers
+    429. Following that hands a 429 to the shared retry session in `http_client.py`,
+    which retries it five times with growing backoff: one wrong slug becomes a slow
+    retry storm against a site that was never going to have the answer, and the
+    Scrape Note a human reads ends up saying "too many 429 error responses" with no
+    mention of the board. `scrapers/personio.py` passes `allow_redirects=False` and
+    reads a 3xx as "no such board". Any future scraper for a platform that redirects
+    rather than 404s needs the same treatment — check before assuming a 404.
 
 ## Traps
 

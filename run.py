@@ -44,7 +44,10 @@ from notion.client import (
 )
 from ats_finder.find_ats import find_ats, find_company_info, find_via_search
 from ats_finder.find_website import derive_website
-from scrapers import greenhouse, lever, ashby, workday, html_generic
+from scrapers import (
+    greenhouse, lever, ashby, workday, workable, personio, breezy,
+    rippling, teamtailor, smartrecruiters, pinpoint, html_generic,
+)
 from scoring.score_jobs import score_all, RUBRIC_FINGERPRINT
 from scoring.track_new_postings import mark_new_postings
 from output_excel import build_workbook
@@ -103,11 +106,23 @@ def print_api_report(dry_run=False):
     print(f"  {'~throttle cost of writes':<28} {report['write_total'] * 0.35:6.0f}s")
 
 
+# Keyed by the platform name as it is written in the Target List "ATS
+# Platform" field. resolve_scraper() matches these whole-word and
+# case-insensitively, so the key has to be the shortest form that is still
+# unambiguous: "Breezy" (not "Breezy HR") because both spellings appear in
+# Notion, "Rippling" (not "Rippling ATS") for the same reason.
 SCRAPERS = {
     "Greenhouse": greenhouse.fetch_jobs,
     "Lever": lever.fetch_jobs,
     "Ashby": ashby.fetch_jobs,
     "Workday": workday.fetch_jobs,
+    "Workable": workable.fetch_jobs,
+    "Personio": personio.fetch_jobs,
+    "Breezy": breezy.fetch_jobs,
+    "Rippling": rippling.fetch_jobs,
+    "Teamtailor": teamtailor.fetch_jobs,
+    "SmartRecruiters": smartrecruiters.fetch_jobs,
+    "Pinpoint": pinpoint.fetch_jobs,
 }
 
 
@@ -434,6 +449,33 @@ SLUG_URL_PATTERNS = {
     ],
     "Lever": [r"jobs\.lever\.co/([a-zA-Z0-9\-_]+)"],
     "Ashby": [r"jobs\.ashbyhq\.com/([^/?#]+)"],
+    # Only apply.workable.com carries a usable slug. The other Workable
+    # link shape in Notion, jobs.workable.com/company/{opaque-id}/..., is
+    # the aggregator front end and its id is NOT the account slug the
+    # widget API takes — matching it would produce a confident 404 on
+    # every run. Left unmatched on purpose so the guess-from-the-name
+    # fallback runs instead, which is what actually resolves Vivani.
+    "Workable": [r"apply\.workable\.com/([^/?#]+)"],
+    "Personio": [r"https?://([a-z0-9\-]+)\.jobs\.personio\.(?:com|de)"],
+    "Breezy": [r"https?://([a-z0-9\-]+)\.breezy\.hr"],
+    "Rippling": [r"ats\.rippling\.com/([^/?#]+)"],
+    "Pinpoint": [r"https?://([a-z0-9\-]+)\.pinpointhq\.com"],
+    "SmartRecruiters": [
+        r"careers\.smartrecruiters\.com/([^/?#]+)",
+        r"jobs\.smartrecruiters\.com/([^/?#]+)",
+        r"api\.smartrecruiters\.com/v1/companies/([^/?#]+)",
+    ],
+    # Teamtailor is the one platform whose "slug" is a whole hostname:
+    # its customers here run on their own domains (career.nordiccapital.com)
+    # rather than a shared vendor path. Matching the bare host of any URL
+    # would be wrong — a Teamtailor-tagged company whose Careers URL is the
+    # Google-search fallback would yield "www.google.com" — so this matches
+    # the vendor namespace plus the careers-subdomain shapes actually seen,
+    # and leaves anything else to the guess fallback.
+    "Teamtailor": [
+        r"https?://([a-z0-9\-]+\.teamtailor\.com)",
+        r"https?://((?:careers?|jobs?|work|life)[a-z0-9\-]*\.[a-z0-9\-]+\.[a-z.]+)",
+    ],
 }
 
 
