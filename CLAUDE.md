@@ -211,7 +211,29 @@ real failure, so preserve them unless the task explicitly says otherwise.
     mention of the board. `scrapers/personio.py` passes `allow_redirects=False` and
     reads a 3xx as "no such board". Any future scraper for a platform that redirects
     rather than 404s needs the same treatment — check before assuming a 404.
-
+20. **Blank is not the only "never researched" state — a structurally impossible
+    value is one too.** Invariant 8 makes blank mean unresearched, which works for a
+    field whose wrong answers are still answers and not at all for one holding
+    something that was never an answer. A batch of rows carried a pasted Notion link
+    in `Careers URL`: non-blank, so `get_companies_missing_url()` skipped them every
+    run while the scrape retried and failed every run, and `derive_website()`
+    propagated it into `Website` — where the page icon (invariant 16) then marked it
+    permanent. Both selectors now test the value, not just its presence:
+    `ats_finder/careers_url.py`'s `is_usable_careers_url()` and
+    `find_website.is_company_domain()`. Two things keep that safe, and both must
+    hold if the lists are ever widened:
+    - **The bar is structural impossibility, not suspicion.** Acting on a rejection
+      means overwriting, so anything a human deliberately chose has to pass. The
+      pre-filled Google *search* is the case that matters — `fill_missing_careers_urls()`
+      writes it as its documented last resort, and rejecting it re-opens the
+      re-research-forever loop invariant 8 closed. Only the `docs.`/`drive.`
+      subdomains are listed; `google.com` itself is not.
+    - **Liveness is never judged here.** A stale or 404ing URL still passes. That is
+      a scrape failure, which `sync_scrape_status()` already surfaces, and calling it
+      invalid would collide with invariant 1.
+    The paired write matters too: `fill_missing_website()` passes `website or ""`, so
+    a genuine "nothing found" *clears* a bad stored value. Passing `None` there would
+    leave it and the selector would reselect the row every run, forever.
 ## Traps
 
 - **`output/` is gitignored in full (except `.gitkeep`) but holds real state.** `score_cache.json` (~500 KB)

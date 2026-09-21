@@ -37,7 +37,7 @@ NON_COMPANY_HOSTS = (
     "workable.com", "personio.com", "personio.de", "paylocity.com",
     "breezy.hr", "comeet.com", "jobvite.com", "recruitee.com",
     "smartrecruiters.com", "icims.com", "bamboohr.com", "homerun.co",
-    "notion.site", "notion.so", "google.com", "linkedin.com",
+    "notion.com", "notion.site", "notion.so", "google.com", "linkedin.com",
     "indeed.com", "glassdoor.com", "wellfound.com", "angel.co",
     "builtin.com", "ziprecruiter.com",
 )
@@ -72,6 +72,19 @@ def _real_company_host(url):
     if any(host == h or host.endswith("." + h) for h in NON_COMPANY_HOSTS):
         return None
     return host
+
+
+def is_company_domain(url):
+    """Public yes/no form of _real_company_host(), for callers that only
+    need to know whether a stored URL points at the company's own site.
+
+    notion/client.py uses it to spot a `Website` value that can never be
+    right — eighteen rows were stamped https://app.notion.com, derived from
+    a Careers URL that was a pasted Notion link. Sharing this test rather
+    than restating the host list there keeps one record of the fact; two
+    copies is how the drift in invariant 9 started.
+    """
+    return _real_company_host(url) is not None
 
 
 def favicon_icon_url(host):

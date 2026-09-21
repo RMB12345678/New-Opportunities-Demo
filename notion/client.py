@@ -15,6 +15,8 @@ import requests
 
 from http_client import session
 from notion import state
+from ats_finder.careers_url import is_usable_careers_url
+from ats_finder.find_website import is_company_domain
 
 NOTION_API_KEY = os.environ["NOTION_API_KEY"]
 NOTION_DATABASE_ID = os.environ["NOTION_DATABASE_ID"]
@@ -181,14 +183,25 @@ def get_companies_missing_url():
     just a URL on those companies is pure waste: we already know the
     answer. Only "AMBIGUOUS"/"N/A"/"Not found" markers are excluded;
     companies with a real ATS platform (even "None (in-house...)") still
-    get searched, since those genuinely might have a findable page."""
+    get searched, since those genuinely might have a findable page.
+
+    Selects on is_usable_careers_url() rather than on a blank field.
+    "Blank means never researched" (invariant 8) is a good test for a field
+    whose wrong answers are still answers, and no test at all for one
+    holding something that was never an answer: a batch of rows carried a
+    pasted Notion link here, and because the field was non-blank this pass
+    skipped them on every run while the scrape retried and failed on every
+    run. The predicate is structural and makes no network call, so a URL
+    that is merely stale or unreachable still passes — that is a scrape
+    failure, which sync_scrape_status() already surfaces, and judging
+    liveness here would collide with invariant 1."""
     return [
         row for row in get_all_companies()
         if row["ats_platform"]
         and "AMBIGUOUS" not in row["ats_platform"]
         and "N/A" not in row["ats_platform"]
         and "Not found" not in row["ats_platform"]
-        and not row["careers_url"]
+        and not is_usable_careers_url(row["careers_url"])
     ]
 
 
@@ -215,7 +228,17 @@ def get_companies_missing_website():
     hand for an unrelated reason will look identical to an already-checked
     one and won't be retried.
     """
-    return [row for row in get_all_companies() if not row["website"] and not row["has_icon"]]
+    return [
+        row for row in get_all_companies()
+        if (not row["website"] and not row["has_icon"])
+        # A Website that points somewhere it can never point — see
+        # is_company_domain() — is wrong no matter what the icon says, and
+        # the icon gate above would otherwise make it permanent. This
+        # clause cannot loop: fill_missing_website() overwrites the bad
+        # value either way, with a real host or with a cleared field plus
+        # the BLANK_ICON stamp, and neither outcome is reselected.
+        or (row["website"] and not is_company_domain(row["website"]))
+    ]
 
 
 def update_company_website(page_id, website=None, icon=None, dry_run=False):

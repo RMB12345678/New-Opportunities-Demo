@@ -398,7 +398,13 @@ def fill_missing_website(dry_run=False):
             print(f"  -> {row['company']}: no website found — stamping blank icon")
             blanked += 1
 
-        update_company_website(row["page_id"], website=website, icon=icon)
+        # website or "" — not website — so a genuine "nothing found"
+        # CLEARS the field rather than leaving it. For a row selected the
+        # original way (blank Website, no icon) the two are identical.
+        # For one selected because its stored Website can never be right,
+        # passing None would leave the bad value in place and the selector
+        # would pick the row up again on every future run.
+        update_company_website(row["page_id"], website=website or "", icon=icon)
         time.sleep(1)  # be polite to Notion's rate limit
 
     print(f"[check] {derived} website(s) derived, {blanked} stamped blank (nothing found), "
