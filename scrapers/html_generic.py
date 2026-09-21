@@ -207,14 +207,25 @@ OVERRIDES = {
 }
 
 
-def fetch_jobs(company_name, careers_url):
+def fetch_jobs(company_name, careers_url, html=None):
+    """html: the page's already-fetched markup, if the caller has it.
+
+    run.py's embedded-board detection fetches every HTML-marked company's
+    careers page before this runs, so passing what it read avoids
+    requesting the same page twice — ~180 duplicate requests a run, on the
+    step that is already the second-slowest and fully sequential (#13).
+    Fetching is otherwise unchanged, so any caller that has no HTML still
+    works exactly as before.
+    """
     if not careers_url:
         raise ValueError(f"No careers_url provided for {company_name}")
     _reject_bare_ats_domain(company_name, careers_url)
 
-    resp = session.get(careers_url, headers=HEADERS, timeout=15)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
+    if html is None:
+        resp = session.get(careers_url, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+        html = resp.text
+    soup = BeautifulSoup(html, "html.parser")
 
     if company_name in OVERRIDES:
         elements = soup.select(OVERRIDES[company_name])

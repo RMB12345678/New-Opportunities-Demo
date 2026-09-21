@@ -158,7 +158,12 @@ HOMEPAGE: <the company's main website URL (e.g. "https://example.com"), or "N/A"
         },
         json={
             "model": "claude-sonnet-5",
-            "max_tokens": 500,
+            # 1500, not 500. With web search enabled the model narrates its
+            # searching before emitting the structured block, and 500 was
+            # not enough room for both — the block got cut off mid-reply,
+            # which is the truncation the stop_reason check below catches.
+            # Raising the cap makes that rare; the check makes it safe.
+            "max_tokens": 1500,
             "tools": [{"type": "web_search_20250305", "name": "web_search"}],
             "messages": [{"role": "user", "content": prompt}],
         },
@@ -176,13 +181,42 @@ HOMEPAGE: <the company's main website URL (e.g. "https://example.com"), or "N/A"
         raise RuntimeError(f"{resp.status_code} error from Anthropic API: {detail}")
     data = resp.json()
 
+    # A reply that ran out of tokens before finishing is neither an error
+    # nor a real answer, and it is the single most dangerous shape this
+    # function can receive: resp.ok is True, the structured block is
+    # missing or half-written, and every _extract() below quietly falls
+    # through to its default — writing "Not found (auto-search failed)"
+    # into Notion as a PERMANENT marker (invariant 8), which then also
+    # excludes the company from the careers-URL backfill. The company
+    # leaves the pipeline on the strength of a reply that never finished.
+    # Raising instead puts it in the existing retry path (invariant 1).
+    if data.get("stop_reason") == "max_tokens":
+        raise RuntimeError(
+            f"research reply for {company_name} hit the token cap before "
+            f"finishing — treating as a failed search, not a 'not found'"
+        )
+
     text = "".join(
         block["text"] for block in data.get("content", []) if block.get("type") == "text"
     )
 
     def _extract(label, default=""):
-        m = re.search(rf"{label}:\s*(.+)", text)
-        return m.group(1).strip() if m else default
+        """Pull one labelled line out of the reply.
+
+        Two details, both of which produced wrong answers before:
+
+        - **Anchored to line starts.** The old pattern searched anywhere in
+          the joined text, so a label appearing mid-sentence in the model's
+          own prose ("...their ATS: Greenhouse, probably...") could win
+          over the real structured line, and a label that is a substring of
+          another word could match by accident.
+        - **Last match, not first.** With web search enabled the model
+          often narrates before answering, and that narration can contain
+          a line that looks like the block. The real block is the one it
+          ends with, so later beats earlier.
+        """
+        matches = re.findall(rf"^[ \t]*{label}:[ \t]*(.*)$", text, re.M)
+        return matches[-1].strip() if matches else default
 
     def _clean_url(raw):
         """The model sometimes appends explanatory commentary after the
@@ -208,6 +242,22 @@ HOMEPAGE: <the company's main website URL (e.g. "https://example.com"), or "N/A"
                 return candidate.rstrip(").,;\"'")
 
         return all_urls[0].rstrip(").,;\"'")
+
+    # A reply carrying none of the three fields that are supposed to be
+    # present unconditionally did not follow the format at all — a refusal,
+    # a pure-prose answer, or a block mangled past recognition. Same
+    # reasoning as the stop_reason check: defaulting here would write a
+    # permanent "Not found" on the strength of a reply we never parsed.
+    # _SENTINEL rather than "" so that a present-but-empty line (a real,
+    # if unhelpful, answer) is still treated as an answer.
+    _SENTINEL = object()
+    if all(_extract(label, _SENTINEL) is _SENTINEL
+           for label in ("AMBIGUOUS", "SECTOR", "ATS")):
+        raise RuntimeError(
+            f"research reply for {company_name} contained none of the "
+            f"AMBIGUOUS/SECTOR/ATS lines the prompt asks for — treating as "
+            f"a failed search, not a 'not found'"
+        )
 
     ambiguous = _extract("AMBIGUOUS", "false").lower().startswith("true")
     url = _clean_url(_extract("URL", "N/A"))

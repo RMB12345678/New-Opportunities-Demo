@@ -234,6 +234,29 @@ real failure, so preserve them unless the task explicitly says otherwise.
     The paired write matters too: `fill_missing_website()` passes `website or ""`, so
     a genuine "nothing found" *clears* a bad stored value. Passing `None` there would
     leave it and the selector would reselect the row every run, forever.
+21. **A careers page naming several ATS boards must never be resolved to one of
+    them.** `ats_finder/find_embedded_board.py` reads a company's real board off its
+    own careers page — a redirect, a `<script>`/`<iframe>` embed, inline JS, or a
+    link — which is what lets 20 HTML-marked companies be scraped through their
+    actual ATS instead of being read as flat HTML. The hazard is that a page can
+    name boards that are not the company's: Atomic VC's careers page lists its
+    portfolio companies' boards (Exowatt, Hims & Hers) beside its own, and Cellino's
+    links to Osmo's. An early version returned Exowatt for Atomic VC. Attaching
+    another company's postings is the same failure as a guessed Workday
+    tenant (invariant 2's neighbourhood) and equally undetectable downstream — the
+    rows look perfectly normal.
+
+    So each tier answers only if **unanimous**: exactly one distinct (platform, slug).
+    Not "the most common", which is precisely the reasoning that picks Exowatt off a
+    page listing eight portfolio boards. On a tie it returns None and the caller
+    falls back to guessing a slug from the name, which at least fails visibly.
+
+    Two consequences worth keeping: Teamtailor is excluded from detection entirely,
+    because its slug pattern has to match a bare careers-subdomain host and so matches
+    almost any careers URL on an arbitrary page (measured: one wrong answer, four
+    false refusals); and a detected platform is used for the run but never written
+    back to `ATS Platform`, which is a researched fact a human may have set —
+    invariant 3. The Scrape Note says what was found and suggests the edit instead.
 ## Traps
 
 - **`output/` is gitignored in full (except `.gitkeep`) but holds real state.** `score_cache.json` (~500 KB)

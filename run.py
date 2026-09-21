@@ -44,6 +44,7 @@ from notion.client import (
 )
 from ats_finder.find_ats import find_ats, find_company_info, find_via_search
 from ats_finder.find_website import derive_website
+from ats_finder.find_embedded_board import detect_embedded_board
 from scrapers import (
     greenhouse, lever, ashby, workday, workable, personio, breezy,
     rippling, teamtailor, smartrecruiters, pinpoint, html_generic,
@@ -595,13 +596,29 @@ def run_scrapers(companies):
 
         if scraper:
             slug = extract_slug(row.get("careers_url"), matched_name)
+            slug_source = "saved URL"
+            if not slug and row.get("careers_url"):
+                # Nothing to read from the saved URL, so the alternative is
+                # slugifying the company name — the guessing invariant 7
+                # exists to stop. Look at the page first: it may embed its
+                # real board, or redirect to it. See
+                # ats_finder/find_embedded_board.py, and note it refuses to
+                # answer rather than guessing when a page names several
+                # boards, which is what keeps an aggregator's portfolio
+                # listings from being attached to this company.
+                found_platform, found_slug, how, _ = detect_embedded_board(
+                    row.get("careers_url"), SLUG_URL_PATTERNS)
+                if found_slug and found_platform == matched_name:
+                    slug, slug_source = found_slug, f"the careers page — {how}"
+                    print(f"[scrape] {row['company']}: found {matched_name} slug "
+                          f"'{slug}' because {how}")
             try:
                 jobs = scraper(row["company"], slug=slug) if slug else scraper(row["company"])
                 for job in jobs:
                     job["company_description"] = row.get("sector")
                 all_jobs.extend(jobs)
                 scraped_ok.add(row["company"])
-                slug_note = f", slug from saved URL" if slug else ""
+                slug_note = f", slug from {slug_source}" if slug else ""
                 print(f"[scrape] {row['company']} (via {matched_name}{slug_note}): {len(jobs)} jobs")
                 record(row, SCRAPE_OK, f"{matched_name}: {len(jobs)} job(s)")
                 continue
@@ -648,8 +665,48 @@ def run_scrapers(companies):
         # genuine, scrapeable company pages).
         is_html = row["scrape_method"] and "HTML" in row["scrape_method"]
         if is_html and row.get("careers_url"):
+            # Before handing this to the generic HTML scraper, look at what
+            # the page actually is. A confirmed 18 of these companies reach
+            # a real ATS board — embedded, or via a redirect — and the
+            # generic scraper reads those pages as ordinary HTML, which is
+            # how they came back with a confident zero (punch list #21
+            # measured that failure; this is the other half of it).
+            #
+            # The detected slug is used for THIS run only. ATS Platform is
+            # a researched fact a human may have set, and invariant 3
+            # forbids the backfill overwriting one — so the Scrape Note
+            # says what was found and leaves the field alone.
+            found_platform, found_slug, how, page_html = detect_embedded_board(
+                row.get("careers_url"), SLUG_URL_PATTERNS)
+            embedded_scraper = SCRAPERS.get(found_platform) if found_slug else None
+
+            if embedded_scraper:
+                try:
+                    jobs = embedded_scraper(row["company"], slug=found_slug)
+                    for job in jobs:
+                        job["company_description"] = row.get("sector")
+                    all_jobs.extend(jobs)
+                    scraped_ok.add(row["company"])
+                    print(f"[scrape] {row['company']} (via {found_platform}, "
+                          f"slug '{found_slug}' from the careers page): {len(jobs)} jobs")
+                    record(row, SCRAPE_OK,
+                           f"{found_platform}: {len(jobs)} job(s). Marked HTML-scrapeable, "
+                           f"but {how} — scraped via {found_platform} instead of the "
+                           f"generic HTML scraper. Setting ATS Platform to "
+                           f"{found_platform} would make this explicit.")
+                    continue
+                except Exception as e:
+                    # The board was named by the page but did not answer.
+                    # Fall through to the HTML scraper rather than giving
+                    # up: the page is still a page, and it is what this
+                    # company got before detection existed.
+                    print(f"[scrape] {row['company']}: {found_platform} board "
+                          f"'{found_slug}' found on the page but failed ({e}) "
+                          f"— falling back to the HTML scraper")
+
             try:
-                jobs = html_generic.fetch_jobs(row["company"], row["careers_url"])
+                jobs = html_generic.fetch_jobs(row["company"], row["careers_url"],
+                                               html=page_html)
                 for job in jobs:
                     job["company_description"] = row.get("sector")
                 all_jobs.extend(jobs)

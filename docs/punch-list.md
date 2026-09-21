@@ -16,7 +16,7 @@ priority order, because several items depend on another landing first.
 |---|---|---|---|---|
 | 1 | Scorer never sees the job description | Critical | 2–3 h | Done |
 | 2 | A failed scrape marks live jobs as closed | Critical | 45 m | Done |
-| 3 | A truncated research reply becomes a permanent "not found" | Critical | 30 m | Open |
+| 3 | A truncated research reply becomes a permanent "not found" | Critical | 30 m | Done (recovery pending) |
 | 4 | Score cache ignores rubric changes | Critical | 30 m | Done |
 | 5 | HTML scraper collapses a company's jobs into one URL | High | 1–2 h | Open |
 | 6 | Two rubric copies, already out of sync | High | 30 m | Done |
@@ -32,7 +32,7 @@ priority order, because several items depend on another landing first.
 | 16 | Scores of 1 and 2 sit in the main list | Low | 20 m | Open |
 | 17 | No run summary, no cost visibility, no tests | Low | 2–3 h | Partial |
 | 18 | Windows console encoding crashes the run on unrenderable characters | High | 5 m | Done |
-| 19 | Embedded ATS boards are undetectable | Critical | 1–2 h | Open |
+| 19 | Embedded ATS boards are undetectable | Critical | 1–2 h | Done |
 | 20 | Notion sync rewrites every row every run | Critical | 3 h | Done |
 | 21 | Named ATS platforms with no scraper | High | 3-4 h | Done |
 | 22 | A wrong saved value is indistinguishable from a researched one | High | 1-2 h | Partial |
@@ -153,6 +153,20 @@ and leaves "New This Run" off.
 
 ## 3. A truncated research reply becomes a permanent "not found"
 **Critical** · `ats_finder/find_ats.py` → `find_via_search()`
+
+**Status: code done 2026-09-21; step 5's recovery pass deliberately not run
+yet.** Steps 1-4 landed. A `stop_reason` of `max_tokens` now raises before
+the text is parsed at all, `max_tokens` went 500 → 1500, a reply carrying
+none of AMBIGUOUS/SECTOR/ATS raises, and `_extract()` anchors labels to line
+starts and takes the LAST match rather than the first. That last one was not
+theoretical: on a reply mentioning "ATS: something in my notes" before the
+real block, the old pattern returned "something in my notes."
+
+Step 5's script exists as `reset_failed_ats_research.py` (with `--dry-run`)
+and is safe to run only now that 1-4 have landed — against the old code it
+would re-create the same 36 markers at full price. Running it costs ~36
+Anthropic research calls, so it is left as a deliberate decision rather than
+bundled into the fix. `tests/test_research_reply.py` covers all four.
 
 `max_tokens: 500` with web search enabled, and nothing checks `stop_reason`. If the
 model gets cut off before emitting its structured block, `resp.ok` is still `True`,
@@ -542,7 +556,45 @@ title containing `→` and crashed before reaching the scoring step.
    console limitation.
 
 ## 19. Embedded ATS boards are undetectable
-**Critical** · `run.py` → `extract_slug()`, `SLUG_URL_PATTERNS`
+**Critical** · `run.py` → `run_scrapers()`, `ats_finder/find_embedded_board.py`
+
+**Status: done, 2026-09-21.** Confirmed first, then built — the item was
+written as unconfirmed, and the investigation note below was right that CMR
+Surgical is not an example of it.
+
+Sweeping all 198 HTML-marked companies that have a Careers URL found **20**
+reaching a real ATS board that nothing was reading, in three shapes: the
+saved URL redirects to the board (8), the page embeds it via script/iframe
+or inline JS (7), or the page links to it (2, plus 3 mixed). Scraped through
+`run_scrapers()` those 20 return **379 postings**. 10 of the 20 have a slug
+the name-guess gets wrong — `bivacor-inc`, `fortuna-health`,
+`patternbioscience`, `shockwave-medical`, `neko-health` — so this is
+invariant 7 one layer earlier, exactly as the item argued.
+
+**Two corrections to the fix as written above.** The embed URL is
+`boards.greenhouse.io/embed/job_board/**js**?for=<slug>`; the form in step 1
+omits the `/js` and would have matched none of the real `<script>` embeds
+(it does appear in Apptronik's *iframe*, so both shapes are matched now).
+And step 2 — writing the detected platform back to `ATS Platform` — was not
+done: that field is a researched fact a human may have set, so invariant 3
+applies. The detected slug is used for the run and the Scrape Note says what
+was found and suggests the field change, leaving the edit to a person.
+
+**The part the item did not anticipate,** and the reason most of
+`tests/test_embedded_board.py` exists: a careers page can name boards that
+are *not* the company's. Atomic VC's lists its portfolio companies' boards
+(Exowatt, Hims & Hers) beside its own; Cellino's links to Osmo's. An early
+version returned Exowatt for Atomic VC. Attaching another company's postings
+is the same hazard as a guessed Workday tenant and equally undetectable
+downstream, so each tier answers only if **unanimous** — one distinct board,
+or it refuses and lets the caller fall back to guessing, which at least
+fails visibly. Both aggregators are correctly refused and fall through to
+the HTML scraper.
+
+Teamtailor is excluded from detection: its pattern has to match a bare
+careers-subdomain host, which against arbitrary page HTML matched almost
+anything — one wrong answer and four false refusals. A Teamtailor board
+embedded on a custom domain is therefore undetectable this way; accepted.
 
 When a company's saved Careers URL is on its own domain (not a
 `boards.greenhouse.io`/`jobs.lever.co`/`jobs.ashbyhq.com` URL), `extract_slug()`

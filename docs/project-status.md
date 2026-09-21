@@ -113,6 +113,12 @@ Listed for pattern-matching if similar symptoms reappear.
   companies are the same thing is not yet known and is worth measuring before more
   scrapers are written.
 
+  Partly answered the same day by #19's sweep: of the 198 HTML-marked companies
+  with a Careers URL, 20 were reaching a real ATS board the generic scraper was
+  reading as ordinary HTML. Those are now scraped properly and contribute 379
+  postings. The remaining ~178 are genuine HTML pages or JS-rendered listings;
+  the latter still need a headless browser (#5).
+
 - **A third of the database is outside the careers-URL backfill.** 162 of 470 rows
   carry a `"Not found"` ATS value, and `get_companies_missing_url()` excludes all of
   them by design — re-searching a URL for a company already answered conclusively is
@@ -151,6 +157,19 @@ Listed for pattern-matching if similar symptoms reappear.
 
 ## Changelog
 
+- **Sep 21, 2026 (later)** — Closed both remaining Critical punch list items.
+  #3: a research reply that ran out of tokens no longer becomes a permanent
+  "Not found (auto-search failed)" — `stop_reason` is checked before the text is
+  parsed, the cap went 500 → 1500, a reply carrying none of the expected fields
+  raises, and `_extract()` anchors to line starts and takes the last match rather
+  than the first (it was returning the model's own narration on replies that
+  narrated before answering). The 36 rows already carrying the marker were cleared
+  so they get re-researched. #19: confirmed the gap was real by sweeping all 198
+  HTML-marked companies with a Careers URL — **20** reach an ATS board nothing was
+  reading, worth **379 postings**, and 10 have a slug the name-guess gets wrong.
+  `ats_finder/find_embedded_board.py` detects them via redirect, embed or link, and
+  refuses rather than guessing when a page names several boards, which is what stops
+  an aggregator's portfolio listings being attached to it. New invariant 21.
 - **Sep 21, 2026** — Audited all 470 `ATS Platform` values against `resolve_scraper()`
   and added the seven scrapers the audit called for (#21): Workable, Personio, Breezy,
   Rippling, Teamtailor, SmartRecruiters, Pinpoint — 25 companies, **106 postings** that
