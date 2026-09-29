@@ -1,11 +1,12 @@
 # Job Agent Punch List
 
-20 improvements, ordered by how much each changes the quality of what lands in the
+23 improvements, ordered by how much each changes the quality of what lands in the
 Notion dashboard. Verified against commit `243b2f2` on 2026-08-22. #18 and #19 were
-found 2026-08-23 during a live `--dry-run`, and #20 on 2026-09-09 while measuring a
-real run, all added after the original 17.
+found 2026-08-23 during a live `--dry-run`, #20 on 2026-09-09 while measuring a
+real run, and #23 on 2026-09-29 by auditing the Job Postings database itself, all
+added after the original 17.
 
-**As of 2026-09-09: 7 done, 1 resolved as intentional, 2 partial, 10 open.**
+**As of 2026-09-29: 10 done, 1 resolved as intentional, 4 partial, 8 open.**
 Each item carries its own status line with what actually landed.
 
 Severity is damage to the output. Effort is a rough estimate for a Claude-assisted
@@ -36,6 +37,7 @@ priority order, because several items depend on another landing first.
 | 20 | Notion sync rewrites every row every run | Critical | 3 h | Done |
 | 21 | Named ATS platforms with no scraper | High | 3-4 h | Done |
 | 22 | A wrong saved value is indistinguishable from a researched one | High | 1-2 h | Partial |
+| 23 | Duplicate rows stay New This Run forever | High | 1 h | Done |
 
 ---
 
@@ -803,6 +805,76 @@ hold a bare `"www.google.com"` — no scheme, no query, unusable by any scraper
    invariant 1 means a fetch that fails to run is not evidence the URL is wrong,
    and a 404 is already a scrape failure the Needs Manual Check view surfaces.
    If it is ever wanted, it belongs beside #5/#19 as scrape-side work.
+
+## 23. Duplicate rows stay "New This Run" forever
+**High** · `scrapers/workable.py`, `run.py`, `notion/client.py`
+
+**Status: done, 2026-09-29.** Found by querying the Job Postings database rather
+than the code: 194 rows had `New This Run` ticked, but only 147 were actually
+created that day. The other **47** had been ticked since a previous run — 39
+Workable duplicates, 1 HTML duplicate (Insmed's "Analyst Coverage", from 9/15),
+and 6 hand-added rows with no URL at all. 19 Workable URLs held **60 rows**
+between them; most were created on 9/21, the first run with the Workable scraper.
+
+**Why they stick.** Three separate things had to line up, which is why no single
+pass caught it:
+
+1. **The duplicates were created in one run.** `existing_by_url` is built once,
+   before the create/update loop. A URL arriving a second time in the same run
+   still reads as "not in Notion" and gets a row of its own.
+2. **No later run can reach them.** `existing_by_url` is a dict: one row per
+   URL. Every subsequent run updates whichever row that dict kept and clears
+   *its* checkbox; the extras are never visited again.
+3. **The close pass does not catch them either.** It only closes rows whose URL
+   is *absent* from this run's scrape, and these URLs are still being scraped
+   every run. So the extras keep both `Still Open` and `New This Run` set
+   permanently.
+
+The 6 URL-less rows fail for a simpler reason: the loop skips anything with no
+URL at the top, and the close pass needs a URL to match on, so nothing in the
+pipeline could ever touch their checkbox.
+
+**Where the repeats came from.** Not pagination. Workable's widget endpoint
+returns one entry *per location* for a multi-location posting — same
+`shortcode`, same apply URL, only city/state/country differing. ARCHIMED's "HR
+Internship (Lyon, France)" comes back six times (Lyon, Paris, Geneva, Brussels,
+Madrid, Berlin). Confirmed against the live endpoint, and measured on the
+2026-09-25 `jobs.json`: 43 of 4,242 postings were repeats of a URL already in
+the file, 39 of them carrying the same title as the copy that was kept — a board
+listing one job twice, not two jobs.
+
+**Fix (all three landed)**
+1. `scrapers/workable.py` collapses entries sharing an apply URL and *merges*
+   their locations (`"Lyon, France / Paris, France / Geneva, France +3 more"`)
+   rather than letting the first city win silently.
+2. `run.py` → `dedupe_jobs_by_url()` runs between the scrape and scoring, so
+   scoring, `jobs.json`, the workbook and the sync all see one job per URL. It
+   is the net under the next platform that repeats a posting, and its log
+   separates exact repeats (nothing lost) from one URL carrying several job
+   titles (roles genuinely dropped — see #5).
+3. `sync_jobs_to_notion()` gained two guards. A URL already written this run is
+   skipped rather than created again, and — the blanket one — **every row Notion
+   already held that is still flagged `New This Run` has the flag cleared at the
+   end of the sync**, whether or not this run's scrape reached it. That last one
+   is deliberately not three targeted fixes: the real failure is that the flag
+   was only ever cleared as a side effect of visiting a row for some other
+   reason, and clearing it on its own terms cannot be defeated by a fourth case
+   nobody has thought of. Only rows whose box is actually set are written, so it
+   costs nothing in a steady state (invariant 12).
+
+Tests: `tests/test_duplicate_postings.py`, plus the Workable collapse cases in
+`tests/test_new_scrapers.py` and the reset/one-row-per-URL cases in
+`tests/test_delta_sync.py`.
+
+**Left open**
+1. **The 40-odd duplicate rows already in Notion are not repaired by this.**
+   Choosing which of two identical rows to archive is a human judgement, and
+   auto-closing a row whose URL *did* come back this run would contradict
+   invariant 2. The sync now counts them and says so on every run, and the reset
+   above at least takes them out of the New This Run view. Archive them by hand.
+2. **A page that links several roles to one URL still loses roles** — Peritas AI
+   (4) and Insmed (1) on the last run. That is punch list #5, and the answer is a
+   per-role URL from the HTML scraper, not a dedupe.
 
 ## Suggested batching
 

@@ -82,17 +82,20 @@ you will trust it.
    path. Personio answers a missing tenant with a 307 to the vendor's marketing site
    rather than a 404, so `scrapers/personio.py` does not follow redirects — see
    invariant 19.
-6. `sync_scrape_status(statuses)` — stamps every Target List row with how its scrape
+6. `dedupe_jobs_by_url()` — collapses postings that share a URL, keeping the first
+   of each, so every later step sees one job per URL. See invariant 22.
+7. `sync_scrape_status(statuses)` — stamps every Target List row with how its scrape
    went. Anything not `OK` is what the Needs Manual Check view shows.
-7. `mark_new_postings()` — flags first-seen postings against `output/seen_jobs.json`.
-8. `score_all()` — batched, cached, fingerprinted, Haiku, rubric as system prompt.
-9. `sync_jobs_to_notion(jobs, scraped_ok)` — dedup by URL, create/update, close what's
-   genuinely gone. **Delta-only**: every owned property is compared against what Notion
-   already holds and only differences are written. A steady-state run writes ~100 rows,
-   not ~3,200. Two things ride along with the same pass: each posting inherits its
-   company's page icon (invariant 17), and `_backfill_applied_dates()` stamps
-   `Date Applied` on rows hand-marked `Application Status` = Applied (invariant 18).
-10. `build_workbook()` — five-tab Excel export.
+8. `mark_new_postings()` — flags first-seen postings against `output/seen_jobs.json`.
+9. `score_all()` — batched, cached, fingerprinted, Haiku, rubric as system prompt.
+10. `sync_jobs_to_notion(jobs, scraped_ok)` — dedup by URL, create/update, close what's
+    genuinely gone, then clear `New This Run` on everything it did not create.
+    **Delta-only**: every owned property is compared against what Notion already holds
+    and only differences are written. A steady-state run writes ~100 rows, not ~3,200.
+    Two things ride along with the same pass: each posting inherits its company's page
+    icon (invariant 17), and `_backfill_applied_dates()` stamps `Date Applied` on rows
+    hand-marked `Application Status` = Applied (invariant 18).
+11. `build_workbook()` — five-tab Excel export.
 
 ## Invariants
 
@@ -257,6 +260,38 @@ real failure, so preserve them unless the task explicitly says otherwise.
     false refusals); and a detected platform is used for the run but never written
     back to `ATS Platform`, which is a researched fact a human may have set —
     invariant 3. The Scrape Note says what was found and suggests the edit instead.
+
+22. **A posting's URL is its identity: one row per URL, and one write per URL per
+    run.** The Job Postings sync builds `existing_by_url` as a dict before its
+    create/update loop, so a URL arriving twice in one run reads as new both times
+    and gets two rows — and a dict holds one row per URL, so no later run can ever
+    visit the second one again. It keeps `Still Open` and `New This Run` set
+    forever, and the close pass cannot retire it either, because its URL *is* still
+    being scraped. 19 Workable URLs held 60 rows between them this way.
+
+    The repeats were real, not a scraping bug in the usual sense: Workable's widget
+    endpoint lists a multi-location posting once per city, same apply URL each time.
+    That is collapsed at source in `scrapers/workable.py` (locations merged, not
+    first-city-wins), `run.py`'s `dedupe_jobs_by_url()` catches whatever the next
+    platform does, and the sync skips a URL it has already written this run. Three
+    layers because the damage is done in the sync but the cause is not visible
+    there. Rows that are already duplicated cannot be repaired from code — picking
+    which copy to archive is a human judgement, and auto-closing one whose URL came
+    back this run would contradict invariant 2 — so the sync counts them and says so
+    on every run instead.
+
+23. **`New This Run` is cleared by a pass of its own, over every row Notion already
+    held.** It means "created by THIS run", and it used to be cleared only as a side
+    effect of visiting a row for some other reason — the update branch, or the close
+    pass. Anything neither pass reached stayed ticked indefinitely: duplicate rows
+    (invariant 22), the six rows added by hand with no URL at all, and rows whose
+    company failed to scrape. 47 of the 194 flagged rows on 2026-09-29 were stuck
+    like that, the oldest since 2026-09-15. The reset runs at the end of
+    `sync_jobs_to_notion()` and writes only rows whose box is actually set, so it
+    costs nothing in a steady state (invariant 12). Fixing the three known cases
+    individually was the tempting version and the wrong one: the failure is the
+    side-effect clearing itself, and a fourth case would have gone the same way.
+
 ## Traps
 
 - **`output/` is gitignored in full (except `.gitkeep`) but holds real state.** `score_cache.json` (~500 KB)

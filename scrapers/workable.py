@@ -21,6 +21,18 @@ response — there is no cursor, offset or `total` in the payload to page
 with — so a single GET is the complete answer, confirmed against the
 largest board in the list (ARCHIMED, 23 postings).
 
+One posting can nonetheless appear several times in that one response.
+Workable repeats a multi-location role once per city, with the same
+`shortcode` and the same apply URL each time and only the city/state/
+country differing: ARCHIMED's "HR Internship (Lyon, France)" comes back
+six times (Lyon, Paris, Geneva, Brussels, Madrid, Berlin). Those are one
+job. Passing them through as six produced six Notion rows for one URL,
+and because the sync can only ever visit one row per URL, the other five
+were left permanently ticked as New This Run and Still Open with nothing
+able to reach them again. So repeats are collapsed here, at the point
+where the reason for them is still visible, and their locations are
+merged into the one job rather than the first city winning silently.
+
 A slug with no open roles answers 200 with `"jobs": []` rather than 404
 (CVRx, Kneu, Medcura and Shockwave Medical all do today). That is a real
 "nothing open", not a failure, and returning [] lets the close pass retire
@@ -48,6 +60,23 @@ def _location(job):
     return "Remote" if job.get("telecommuting") else None
 
 
+# How many of a posting's locations to name before summarising the rest.
+# Six cities joined end to end is a location field nobody reads; three and
+# a count says the same thing and still fits in a Notion table cell.
+LOCATIONS_NAMED = 3
+
+
+def _merged_location(locations):
+    """One location string for a posting Workable listed once per city."""
+    locations = list(dict.fromkeys(loc for loc in locations if loc))
+    if not locations:
+        return None
+    if len(locations) <= LOCATIONS_NAMED:
+        return " / ".join(locations)
+    return (" / ".join(locations[:LOCATIONS_NAMED])
+            + f" +{len(locations) - LOCATIONS_NAMED} more")
+
+
 def fetch_jobs(company_name, slug=None):
     slug = slug or slugify(company_name)
     url = f"https://apply.workable.com/api/v1/widget/accounts/{slug}?details=true"
@@ -55,18 +84,31 @@ def fetch_jobs(company_name, slug=None):
     resp.raise_for_status()
     jobs = resp.json().get("jobs", [])
 
+    # Collapse the per-city repeats described above, keyed on the apply
+    # URL because that is the identity the rest of the pipeline uses. A
+    # posting with no URL at all gets a key of its own rather than
+    # colliding with every other URL-less posting on the board.
+    collapsed = {}
+    for job in jobs:
+        # `url` and `shortlink` are the same apply.workable.com/j/{code}
+        # link today, but only `shortlink` is documented as stable, so
+        # it is the fallback rather than the other way round.
+        job_url = job.get("url") or job.get("shortlink")
+        key = job_url or ("no-url", len(collapsed))
+        if key in collapsed:
+            collapsed[key][1].append(_location(job))
+        else:
+            collapsed[key] = (job, [_location(job)])
+
     return [
         {
             "company": company_name,
             "title": job["title"],
-            "location": _location(job),
-            # `url` and `shortlink` are the same apply.workable.com/j/{code}
-            # link today, but only `shortlink` is documented as stable, so
-            # it is the fallback rather than the other way round.
+            "location": _merged_location(locations),
             "url": job.get("url") or job.get("shortlink"),
             "posted_at": job.get("published_on") or job.get("created_at"),
             "description": job.get("description"),  # HTML; scoring cleans it
             "source_ats": "Workable",
         }
-        for job in jobs
+        for job, locations in collapsed.values()
     ]

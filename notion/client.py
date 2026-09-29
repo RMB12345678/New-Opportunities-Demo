@@ -630,6 +630,12 @@ def sync_jobs_to_notion(jobs, scraped_ok, dry_run=False, rubric_fingerprint=None
       flipped to false (not deleted — the history stays, it's just marked
       closed), but ONLY when its company is in scraped_ok. See the close
       pass below for why that qualifier is the entire point.
+    - Finally, every row Notion already held that is still flagged New
+      This Run has the flag cleared, whether or not this run's scrape
+      reached it. "New" means created by this run; a row no pass happened
+      to visit is not new, it is just unvisited, and a URL only one row
+      can be reached for is exactly how 47 rows came to be sitting in the
+      New This Run view permanently.
 
     scraped_ok comes from run_scrapers() and holds the names of the
     companies whose scrape actually completed this run.
@@ -694,7 +700,24 @@ def sync_jobs_to_notion(jobs, scraped_ok, dry_run=False, rubric_fingerprint=None
                                 for row in company_pages if row.get("icon_url")}
 
     existing = _query_all_job_postings(company_name_by_page_id)
-    existing_by_url = {row["url"]: row for row in existing if row.get("url")}
+    # One row per URL: a dict can hold no more, which is exactly why a
+    # duplicate row is unreachable once it exists. Say so out loud rather
+    # than silently updating one of them — the loop below cannot fix
+    # these, only stop making more, and the stuck ones need archiving by
+    # hand. The New This Run reset at the end of this function at least
+    # stops them sitting in the New This Run view forever.
+    existing_by_url = {}
+    duplicate_rows = 0
+    for row in existing:
+        if not row.get("url"):
+            continue
+        if row["url"] in existing_by_url:
+            duplicate_rows += 1
+        existing_by_url[row["url"]] = row
+    if duplicate_rows:
+        print(f"     [warn] Notion holds {duplicate_rows} duplicate row(s) — rows "
+              f"sharing a URL with another row. Only one row per URL can be kept "
+              f"up to date; the extras are unreachable and want archiving by hand.")
 
     # Application Status is set by hand in Notion; a real "stamp the date
     # the moment the status changes" automation is a Notion database
@@ -708,12 +731,31 @@ def sync_jobs_to_notion(jobs, scraped_ok, dry_run=False, rubric_fingerprint=None
 
     seen_urls_this_run = set()
     created, updated, unchanged, failed = 0, 0, 0, 0
+    repeats = 0
     failed_jobs = []
+    # Page ids whose New This Run box this run has already dealt with, so
+    # the blanket reset at the end knows not to write them again. Added to
+    # only after the write succeeds: a row whose update failed is still
+    # stuck, and the reset pass retrying just the checkbox is the right
+    # outcome, not a double write.
+    flag_cleared = set()
 
     for job in jobs:
         url = job.get("url")
         if not url:
             continue  # can't dedup or relate without a URL, skip rather than risk a duplicate
+        if url in seen_urls_this_run:
+            # The same URL twice in one run. run.py collapses these before
+            # scoring (dedupe_jobs_by_url), so reaching here means a new
+            # source of repeats; the guard stays regardless, because this
+            # is the loop where a repeat does the damage. existing_by_url
+            # is built once, before the loop, so a repeat of a URL created
+            # moments ago still reads as "not in Notion" and gets a second
+            # row — which no later run can ever visit, leaving it New This
+            # Run and Still Open forever. First copy wins, same rule as
+            # the dedupe pass.
+            repeats += 1
+            continue
         seen_urls_this_run.add(url)
 
         company_page_id = company_page_by_name.get(job.get("company"))
@@ -762,6 +804,8 @@ def sync_jobs_to_notion(jobs, scraped_ok, dry_run=False, rubric_fingerprint=None
                                        _describe_changes(job, row, changed))
                 _update_job_posting(row["page_id"], changed, icon_url=icon_url, dry_run=dry_run)
                 updated += 1
+                if "New This Run" in changed:
+                    flag_cleared.add(row["page_id"])
         except Exception as e:
             # A single job's write failing (transient Notion outage, rate
             # limit, etc.) should NOT take down the entire sync — and by
@@ -869,8 +913,58 @@ def sync_jobs_to_notion(jobs, scraped_ok, dry_run=False, rubric_fingerprint=None
                                        f"{row.get('company')} scraped OK")
                 _update_job_posting(row["page_id"], properties, dry_run=dry_run)
                 closed += 1
+                if "New This Run" in properties:
+                    flag_cleared.add(row["page_id"])
             except Exception as e:
                 print(f"     [sync failed] closing {row.get('url')}: {e}")
+
+    # --- New This Run reset --------------------------------------------
+    # New This Run means "created by THIS run", so every row Notion
+    # already held when the run started must come out of it unticked.
+    # The two passes above only reach rows this run produced a URL for,
+    # which left three kinds of row ticked forever:
+    #
+    #   - duplicate rows. existing_by_url holds one row per URL, so the
+    #     update branch clears the flag on one of them and never sees the
+    #     rest; the close pass skips them too, because their URL *did*
+    #     turn up this run. 39 Workable rows and 1 HTML row were stuck
+    #     like this on 2026-09-29.
+    #   - rows with no URL at all — six added to Notion by hand. The loop
+    #     skips them at the top and the close pass needs a URL to match,
+    #     so nothing in the pipeline could ever touch their checkbox.
+    #   - rows whose company failed to scrape this run: not updated
+    #     (no URL came back) and deliberately not closed (invariant 2).
+    #
+    # A blanket reset rather than three targeted fixes, because the
+    # failure is not really any of those three: it is that the flag was
+    # only ever cleared as a side effect of visiting a row for some other
+    # reason. Clearing it on its own terms cannot be defeated by a fourth
+    # case. Only rows whose box is actually set are written, so in a
+    # steady state this costs nothing (invariant 12) — the cost is one
+    # write per row the previous run created, which is the same handful
+    # the update branch was already paying for.
+    stuck = [row for row in existing
+             if row.get("new_this_run") and row["page_id"] not in flag_cleared]
+    unflagged = 0
+    for row in stuck:
+        try:
+            properties = {"New This Run": "__NO__"}
+            if dry_run:
+                _log_planned_write(
+                    row["page_id"], properties,
+                    f"New This Run still set on a row this run did not create "
+                    f"({row.get('url') or 'no URL on this row'})")
+            _update_job_posting(row["page_id"], properties, dry_run=dry_run)
+            unflagged += 1
+        except Exception as e:
+            print(f"     [sync failed] clearing New This Run on {row['page_id']}: {e}")
+
+    if repeats:
+        print(f"     {repeats} posting(s) repeated a URL already written this run "
+              f"and were skipped — one row per URL, first copy wins")
+    if unflagged:
+        print(f"     {unflagged} row(s) had New This Run cleared by the reset pass "
+              f"(rows this run did not create and did not otherwise touch)")
 
     if left_open_failed:
         failed_companies = {row["company"] for row in left_open_failed}
@@ -881,14 +975,16 @@ def sync_jobs_to_notion(jobs, scraped_ok, dry_run=False, rubric_fingerprint=None
               f"relation left open — check these manually")
 
     counts = {"created": created, "updated": updated, "unchanged": unchanged,
-              "closed": closed, "failed": failed}
+              "closed": closed, "unflagged": unflagged, "failed": failed}
     # Written last, and only on a real run: a rehearsal that advanced
     # last_run would make the next real run stamp closing postings with the
     # date of a run that never happened.
     state.save(rubric_fingerprint, counts=counts, dry_run=dry_run)
 
     return {"created": created, "updated": updated, "unchanged": unchanged,
-            "closed": closed, "failed": failed, "failed_jobs": failed_jobs,
+            "closed": closed, "unflagged": unflagged, "repeats": repeats,
+            "duplicate_rows": duplicate_rows,
+            "failed": failed, "failed_jobs": failed_jobs,
             "left_open": len(left_open_failed),
             "left_open_unresolved": len(left_open_unresolved),
             "close_aborted": close_aborted,

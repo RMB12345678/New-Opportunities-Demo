@@ -109,6 +109,7 @@ def sync(existing_rows, jobs, scraped_ok=frozenset({ACME}), dry_run=False):
         if dry_run:
             return None
         creates.append(props)
+        return {"id": "created-%d" % len(creates)}   # the real helper returns the new page
 
     nc._query_all_target_list_pages = lambda: list(TARGETS)
     nc._query_all_job_postings = lambda lookup=None: [dict(r) for r in existing_rows]
@@ -182,6 +183,86 @@ def test_new_url_is_created_and_flagged_new():
         "Last Seen is written once, at creation"
     assert props["userDefined:URL"] == "http://acme/new"
     assert props["Company"] == ["pg-acme"]
+
+
+def test_new_this_run_is_cleared_on_a_row_this_run_never_scraped():
+    """The stuck-checkbox bug. A row flagged last run whose URL does not
+    come back this run — its company failed to scrape, or it has no URL at
+    all because it was added to Notion by hand — was never visited by the
+    update loop and never closed, so nothing ever unticked it. 47 rows
+    were sitting in the New This Run view like that on 2026-09-29."""
+    rows = [jrow(url="http://acme/1", pid="j1", new_this_run=True),
+            jrow(url=None, pid="j-manual", new_this_run=True, company=None)]
+    res, writes, _ = sync(rows, [], scraped_ok=frozenset())
+    assert res["unflagged"] == 2
+    assert sorted(writes) == sorted([("j1", {"New This Run": "__NO__"}),
+                                     ("j-manual", {"New This Run": "__NO__"})])
+    assert res["closed"] == 0, "nothing may close here — the company did not scrape"
+
+
+def test_the_reset_leaves_unflagged_rows_alone():
+    """Blanket does not mean unconditional: a row whose box is already
+    clear must not be written, or the reset gives back the whole saving
+    the delta sync exists for (invariant 12)."""
+    res, writes, _ = sync([jrow(new_this_run=False)], [], scraped_ok=frozenset())
+    assert writes == []
+    assert res["unflagged"] == 0
+
+
+def test_a_row_the_update_branch_already_unflagged_is_not_written_twice():
+    """The update branch clears the flag as part of a write it was making
+    anyway, which is cheaper than a second PATCH. The reset must notice
+    that and leave it alone — `existing` still says True, because it was
+    read before the write went out."""
+    res, writes, _ = sync([jrow(new_this_run=True)], [job()])
+    assert writes == [("j1", {"New This Run": "__NO__"})]
+    assert res["unflagged"] == 0
+
+
+def test_a_closing_row_is_not_unflagged_twice_either():
+    rows = [jrow(url="http://acme/gone", pid="j1", new_this_run=True)]
+    rows += [jrow(url="http://acme/pad%d" % i, pid="p%d" % i) for i in range(30)]
+    jobs = [job(url="http://acme/pad%d" % i) for i in range(30)]
+    res, writes, _ = sync(rows, jobs)
+    assert res["closed"] == 1 and res["unflagged"] == 0
+    closing = [w for w in writes if w[0] == "j1"]
+    assert len(closing) == 1, "the close write already carried the flag reset"
+    assert closing[0][1]["New This Run"] == "__NO__"
+
+
+# --- one row per URL --------------------------------------------------
+
+def test_the_same_url_twice_in_one_run_creates_one_row():
+    """Where the duplicates came from. existing_by_url is built once,
+    before the loop, so the second copy of a URL created moments earlier
+    still read as "not in Notion" and got a row of its own — one no later
+    run could ever reach, because the sync can only update one row per
+    URL. 19 Workable URLs held 60 rows between them."""
+    res, writes, creates = sync([], [job(url="http://acme/new"),
+                                     job(url="http://acme/new", location="Paris")])
+    assert res["created"] == 1, "one URL, one row"
+    assert res["repeats"] == 1
+    assert len(creates) == 1
+    assert writes == [], "the repeat must not turn into a second write either"
+
+
+def test_a_repeat_of_an_existing_url_is_not_written_twice():
+    res, writes, _ = sync([jrow(score=7)],
+                          [job(score=9), job(score=9, location="Paris")])
+    assert res["updated"] == 1 and res["repeats"] == 1
+    assert writes == [("j1", {"Score": 9})],         "the second copy must not fight the first over Location"
+
+
+def test_duplicate_rows_already_in_notion_are_reported_and_unflagged():
+    """Rows that already exist in duplicate cannot be repaired from here —
+    archiving one of two identical rows is a human judgement. What the
+    sync can do is say how many there are, and make sure the unreachable
+    copy stops showing up in the New This Run view."""
+    rows = [jrow(url="http://acme/1", pid="j1"),
+            jrow(url="http://acme/1", pid="j1-dupe", new_this_run=True)]
+    res, writes, _ = sync(rows, [job(url="http://acme/1")])
+    assert res["duplicate_rows"] == 1
+    assert ("j1-dupe", {"New This Run": "__NO__"}) in writes
 
 
 # --- close pass -------------------------------------------------------

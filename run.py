@@ -515,6 +515,76 @@ def extract_workday_params(careers_url):
     return workday.parse_board_url(careers_url)
 
 
+def dedupe_jobs_by_url(jobs):
+    """Collapse jobs that share a URL, keeping the first of each.
+
+    The URL is a posting's identity everywhere downstream: the Notion sync
+    keys on it, and mark_new_postings() keys its seen-list on it. Two jobs
+    with the same URL are therefore the same posting however else they
+    differ, and letting both through does not produce two postings — it
+    produces a second Notion row that nothing can ever visit again,
+    because sync_jobs_to_notion() builds one row per URL. Those orphans
+    keep New This Run and Still Open ticked forever: 40 rows were stuck
+    like that in Notion on 2026-09-29, the oldest since 2026-09-15, and
+    the 2026-09-25 run's jobs.json carried 43 repeats out of 4,242
+    postings.
+
+    Two sources, both real. Workable's widget API repeats a
+    multi-location posting once per city; that is fixed at source in
+    scrapers/workable.py, and this pass is the net under the next
+    platform that does the same. And an HTML careers page can link one
+    URL under several job titles — Peritas AI lists four distinct roles
+    that all point at /careers. That second case does lose information,
+    and deliberately: with no per-role URL there is nothing to tell the
+    roles apart downstream, so the sync could never have held them as
+    separate rows either. The log names the companies losing jobs so it
+    is visible rather than silent.
+
+    Jobs with no URL pass through untouched. They cannot collide with
+    anything, and the sync skips them.
+    """
+    kept_by_url = {}
+    kept, dropped = [], []
+    for job in jobs:
+        url = job.get("url")
+        if not url:
+            kept.append(job)
+            continue
+        first = kept_by_url.get(url)
+        if first is not None:
+            dropped.append((job, first))
+            continue
+        kept_by_url[url] = job
+        kept.append(job)
+
+    if not dropped:
+        print("[dedupe] no two postings shared a URL")
+        return kept
+
+    by_company = {}
+    for job, first in dropped:
+        by_company.setdefault(job.get("company"), []).append((job, first))
+    print(f"[dedupe] {len(dropped)} posting(s) shared a URL with one already kept "
+          f"and were dropped — one row per URL is what Notion can hold:")
+    for company, entries in sorted(by_company.items(), key=lambda kv: -len(kv[1]))[:10]:
+        urls = {job["url"] for job, _ in entries}
+        # Copies carrying the same title are a board listing one posting
+        # twice, and nothing is lost. Copies carrying DIFFERENT titles are
+        # a page that gives several roles the same link, so collapsing
+        # them really does drop roles — worth naming separately, because
+        # the answer to that one is a per-role URL, not a dedupe.
+        retitled = {job["url"] for job, first in entries
+                    if job.get("title") != first.get("title")}
+        detail = (f"{len(retitled)} of them carrying more than one job title"
+                  if retitled else "all exact repeats")
+        print(f"       - {company}: {len(entries)} dropped across "
+              f"{len(urls)} URL(s), {detail}")
+    if len(by_company) > 10:
+        print(f"       ... and {len(by_company) - 10} more companies")
+
+    return kept
+
+
 def run_scrapers(companies):
     """Scrape every company and return (all_jobs, scraped_ok, statuses).
 
@@ -773,7 +843,12 @@ def main():
     print(f"{len(scraped_ok)} company(ies) scraped successfully; only their postings "
           f"are eligible to be marked closed below")
 
-    print("\n=== Step 5a: stamping scrape status onto the Target List ===")
+    print("\n=== Step 5a: collapsing postings that share a URL ===")
+    with timed("4b dedupe_jobs_by_url"):
+        jobs = dedupe_jobs_by_url(jobs)
+    print(f"{len(jobs)} posting(s) with a distinct URL go forward to scoring and Notion")
+
+    print("\n=== Step 5b: stamping scrape status onto the Target List ===")
     needs_check = [s for s in statuses if s["status"] != SCRAPE_OK]
     with timed("5  sync_scrape_status"):
         status_result = sync_scrape_status(statuses, dry_run=dry_run)
@@ -805,7 +880,13 @@ def main():
     print(f"{'[dry-run] would sync' if dry_run else 'Notion'}: "
           f"{sync_result['created']} created, {sync_result['updated']} updated, "
           f"{sync_result['unchanged']} unchanged (not written), "
-          f"{sync_result['closed']} marked closed (no longer posted)")
+          f"{sync_result['closed']} marked closed (no longer posted), "
+          f"{sync_result['unflagged']} unflagged by the New This Run reset")
+    if sync_result.get("duplicate_rows"):
+        print(f"[warn] {sync_result['duplicate_rows']} Notion row(s) share a URL with "
+              f"another row. Only one row per URL can be kept up to date — the extras "
+              f"are unreachable and want archiving by hand. Their New This Run flag "
+              f"has been cleared so they no longer show up as new.")
     if sync_result.get("date_applied_backfilled"):
         print(f"{'[dry-run] would stamp' if dry_run else 'Stamped'} Date Applied on "
               f"{sync_result['date_applied_backfilled']} posting(s) marked Applied "

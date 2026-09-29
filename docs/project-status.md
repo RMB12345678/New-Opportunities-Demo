@@ -95,6 +95,15 @@ Listed for pattern-matching if similar symptoms reappear.
   filters its Needs Review tab on the scorer's literal. Invariant 13 in `CLAUDE.md`
   records the other three traps of this shape.
 
+- **Duplicate rows stayed "New This Run" forever** (punch list #23) → Workable's
+  widget endpoint lists a multi-location posting once per city, and
+  `existing_by_url` is built once before the create loop, so each repeat in that
+  run got its own Notion row. A dict holds one row per URL, so no later run could
+  ever visit the extras: 19 Workable URLs held 60 rows, and 47 rows had been
+  sitting in the New This Run view for up to two weeks. Fixed at three levels —
+  collapsed at the source, deduped run-wide before scoring, and a blanket
+  end-of-sync reset that clears the flag on every row this run did not create.
+
 ## Open issues not in the punch list
 
 - **Scrape coverage is the biggest gap.** On the Sep 9 run, 87 companies produced
@@ -157,6 +166,18 @@ Listed for pattern-matching if similar symptoms reappear.
 
 ## Changelog
 
+- **Sep 29, 2026** — Fixed duplicate Job Postings rows that stayed flagged
+  `New This Run` indefinitely (#23). Found in the data, not the code: 194 rows
+  were ticked and only 147 had been created that day. Root cause was Workable
+  returning a multi-location posting once per city, multiplied by an
+  `existing_by_url` map built before the create loop — so repeats within one run
+  became rows nothing could reach afterwards. Workable now collapses per-city
+  repeats and merges their locations, `run.py` dedupes every scrape by URL before
+  scoring, and the sync clears `New This Run` on every pre-existing row at the end
+  of the run rather than only on the rows it happened to visit. The ~40 duplicate
+  rows already in Notion are counted and reported each run but archived by hand:
+  picking which copy to keep is a human call, and auto-closing a row whose URL is
+  still being scraped would contradict invariant 2.
 - **Sep 21, 2026 (later)** — Closed both remaining Critical punch list items.
   #3: a research reply that ran out of tokens no longer becomes a permanent
   "Not found (auto-search failed)" — `stop_reason` is checked before the text is

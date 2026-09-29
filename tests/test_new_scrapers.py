@@ -190,6 +190,51 @@ def test_workable_remote_role_says_remote_rather_than_nothing():
         restore(workable)
 
 
+def test_workable_collapses_a_posting_listed_once_per_city():
+    """Workable repeats a multi-location role once per city, same
+    shortcode and same apply URL each time. Six entries for ARCHIMED's
+    "HR Internship (Lyon, France)" became six Notion rows for one URL,
+    five of which nothing could ever visit again."""
+    cities = ["Lyon", "Paris", "Geneva", "Brussels"]
+    payload = {"jobs": [dict(WORKABLE_JOB, city=c, state="", country="France")
+                        for c in cities]}
+    stub(workable, lambda url, **kw: FakeResponse(payload))
+    try:
+        jobs = workable.fetch_jobs("Acme", slug="acme")
+    finally:
+        restore(workable)
+
+    assert len(jobs) == 1, "one URL is one posting, however many cities it lists"
+    assert jobs[0]["location"] == "Lyon, France / Paris, France / Geneva, France +1 more",         "every city the board named is kept — the first one does not just win"
+    assert set(jobs[0]) == JOB_KEYS
+
+
+def test_workable_keeps_genuinely_different_postings_apart():
+    """The collapse keys on the apply URL, so two real roles stay two."""
+    other = dict(WORKABLE_JOB, title="Regulatory Lead",
+                 url="https://apply.workable.com/j/XYZ789",
+                 shortlink="https://apply.workable.com/j/XYZ789")
+    stub(workable, lambda url, **kw: FakeResponse({"jobs": [WORKABLE_JOB, other]}))
+    try:
+        jobs = workable.fetch_jobs("Acme", slug="acme")
+    finally:
+        restore(workable)
+    assert len(jobs) == 2
+    assert {j["title"] for j in jobs} == {"Quality Engineer", "Regulatory Lead"}
+
+
+def test_workable_postings_with_no_url_are_not_collapsed_together():
+    """A missing URL is not an identity two postings share."""
+    blank = dict(WORKABLE_JOB, url=None, shortlink=None)
+    stub(workable, lambda url, **kw: FakeResponse(
+        {"jobs": [blank, dict(blank, title="Regulatory Lead")]}))
+    try:
+        jobs = workable.fetch_jobs("Acme", slug="acme")
+    finally:
+        restore(workable)
+    assert len(jobs) == 2
+
+
 def test_workable_empty_board_is_a_real_answer():
     """CVRx, Kneu, Medcura and Shockwave Medical all answer 200 with an
     empty list today. That is "nothing open", not a failure, and it has to
