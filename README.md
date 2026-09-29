@@ -22,17 +22,24 @@ removed — that stays in a private database, not committed here.*
    their sector, HQ, and careers page URL — flagging ambiguous name
    collisions rather than guessing.
 2. **Scrapes job postings** — using real public APIs for companies on
-   Greenhouse, Lever, or Ashby, and a best-effort generic scraper for
-   companies with in-house career pages.
+   Greenhouse, Lever, Ashby, Workday, Workable, Personio, Breezy,
+   Rippling, Teamtailor, SmartRecruiters or Pinpoint, and a best-effort
+   generic scraper for companies with in-house career pages. A page that
+   only *looks* in-house is checked first for an ATS board it embeds,
+   redirects to or links — but only when the page names exactly one, so a
+   careers page listing a portfolio of other companies' boards is refused
+   rather than guessed at.
 3. **Scores every posting** against a rubric (`scoring/rubric.md`) using
    Claude — the posting's own text, not just its title — batched and
    cached to keep API costs low. The cache is fingerprinted against the
    rubric, so editing the rubric re-scores everything instead of serving
    stale answers.
 4. **Syncs results to Notion**, deduplicated by URL, with dedicated views
-   for new postings, scored matches, ambiguous cases needing review,
-   non-fits, and applications sent. A posting is only marked closed when
-   its company actually scraped — a timeout never retires a live job.
+   for new postings, scored matches, non-fits, applications sent, and the
+   full list. A posting is only marked closed when its company actually
+   scraped — a timeout never retires a live job, and the sync writes only
+   the properties that actually changed: a steady-state run touches around
+   a hundred rows rather than every row it can see.
 5. **Rehearses before it spends.** `--dry-run` performs every read and
    scrape but skips all writes and all paid calls, printing what it would
    have done.
@@ -48,12 +55,14 @@ flowchart TD
     S3["Backfill missing Careers URL\nIf ATS already confirmed: search targets\nTHAT platform's URL pattern specifically\nFallback chain: dedicated page -> homepage -> Google search"] --> S4
 
     S4{"Scrape\nATS Platform?"}
-    S4 -->|Greenhouse / Lever / Ashby| S4a["Hit real public API\nUse CONFIRMED slug from saved URL first,\nfall back to guessing from company name"]
-    S4 -->|HTML / in-house page| S4b["Generic scraper\nheuristic: job-title-like link text,\nfilters nav/footer noise"]
+    S4 -->|One of eleven API-backed platforms| S4a["Hit real public API\nUse CONFIRMED slug from saved URL first,\nfall back to guessing from company name"]
+    S4 -->|HTML / in-house page| S4b["Look for an embedded ATS board first\n(redirect, embed or link — and only if the\npage names exactly one board)\nelse generic scraper: job-title-like link\ntext, filters nav/footer noise"]
     S4 -->|No ATS found / Ambiguous| S4c["Skipped -> Needs Manual Check"]
 
-    S4a --> S5
-    S4b --> S5
+    S4a --> S4d
+    S4b --> S4d
+
+    S4d["Collapse postings sharing a URL\nthe URL is a posting's identity, and\nNotion holds one row per URL"] --> S5
 
     S5["Flag new postings\n'new' is based on Notion's own\ncreate-vs-update check"] --> S6
 
@@ -67,7 +76,7 @@ flowchart TD
     S6d --> S7
     S6e --> S7
 
-    S7["Sync to Notion\nDedup by URL\nClose only rows whose company scraped OK\nAbort the close pass if >25% would close\nRetries with backoff on transient failures"] --> S8
+    S7["Sync to Notion\nDedup by URL; write only what changed\nClose only rows whose company scraped OK\nAbort the close pass if >25% would close\nClear 'New This Run' on every row\nthis run did not create\nRetries with backoff on transient failures"] --> S8
     S8["Excel export\nfive tabs: the four scoring views\nplus Needs Manual Check"] --> End([Done])
 
     style S4a fill:#d4edda
@@ -93,6 +102,19 @@ flowchart TD
   companies that scraped successfully — and a run that would close more
   than 25% of open rows aborts the close pass entirely rather than
   retiring a live board on one bad afternoon.
+- **Writes only what changed**: every property the pipeline owns is
+  compared against what Notion already holds, and a row with nothing new
+  to say costs zero writes. Getting that right is subtler than it looks —
+  a comparison that can never be equal (Notion returns its own casing for
+  a select, `7.0` for a `7`, `None` for an empty text field) rewrites its
+  row on every run while the sync still reports itself healthy. That is
+  why the dry run prints *why* each write is planned, not just that it is.
+- **A URL is a posting's identity**: one row per URL, and one write per
+  URL per run. A board that lists a multi-location role once per city
+  used to produce one Notion row per city, and since the sync can only
+  keep one row per URL up to date, the extras became unreachable — stuck
+  open and flagged new forever. Repeats are now collapsed at the source,
+  again across the whole run, and once more inside the sync itself.
 - **Persistent negative caching**: every "checked, nothing found" result
   writes a permanent marker, so a company is never re-researched (and
   re-paid for) once genuinely checked. A search that *fails* due to an
@@ -151,19 +173,33 @@ You'll need two Notion databases:
 
 **Target List** — Company (title), Sector / Focus (text), HQ (text),
 Source (text), ATS Platform (text), Scrape Method (text), Careers URL
-(URL type), Jobs (relation → Job Postings)
+(URL type), Website (URL type), Jobs (relation → Job Postings), Scrape
+Status (select: OK / Failed / No Scraper / No Careers URL), Scrape Note
+(text), Failing Since (date)
+
+Those last three are a stamp the pipeline computes each run, and the page
+icon is pipeline-owned too — a favicon where the company's domain
+resolves, a blank square where it genuinely doesn't. A "Needs Manual
+Check" view filtered on `Scrape Status is not OK` and sorted by
+`Failing Since` ascending puts the oldest breakage first.
 
 **Job Postings** — Job Title (title), Company (relation → Target List),
 Score (number), Routing (select: Scored / Needs Review / Non-fit),
 Reasoning (text), Ambiguity Note (text), IC Role (checkbox), Location
 (text), URL (url), ATS (text), First Seen / Last Seen (date), Still Open
-(checkbox), New This Run (checkbox), Date Applied (date), Application
-Notes (text), Application Summary (formula)
+(checkbox), New This Run (checkbox), Application Status (select), Date
+Applied (date), Application Notes (text), Application Summary (formula)
 
-Views on Job Postings: New This Run, Scored List, Needs Review,
-Non-fits, Applications. `Date Applied`, `Application Notes`, and the
-`Application Summary` formula that reads them are yours to fill in by
-hand — the pipeline never writes to them.
+Views on Job Postings: Scored List, New This Run, Applications,
+Non-fits, and a Total list. There is deliberately no Needs Review view —
+"Needs Review" is a `Routing` option, so it shows as a column and those
+postings turn up in New This Run anyway.
+
+`Application Status` and `Application Notes` are yours to set by hand;
+the pipeline only reads them. The one thing it does with them is stamp
+today's date on `Date Applied` when it finds a row marked Applied with
+the date still blank — the free substitute for a Notion automation that
+would need a paid plan.
 
 `Careers URL` and `URL` must be Notion **URL**-type properties, not rich
 text — Notion rejects an empty string on a URL property, so empty is
@@ -193,10 +229,16 @@ detected automatically.
 python -m pytest tests/
 ```
 
-The suite is offline — no network, no API keys, no Notion. It covers the
-close-pass rules that decide whether a posting is retired: company-relation
+The suite is offline — no network, no API keys, no Notion, and it stubs
+the on-disk run state so a test run can never advance it. It covers the
+close-pass rules that decide whether a posting is retired (company-relation
 resolution, the scraped-successfully guard, the 25% ratio valve, its 20-row
-floor, and the empty-database case.
+floor, the empty-database case), the delta sync and the comparison traps
+that would otherwise rewrite every row on every run, the one-row-per-URL
+rule and the "New This Run" reset, each ATS scraper's slug extraction and
+job-dict contract, embedded-board detection and its refusal to guess when a
+page names several boards, and the checks that tell a never-researched field
+apart from one holding a wrong value.
 
 ## License
 
