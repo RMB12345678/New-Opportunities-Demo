@@ -50,7 +50,7 @@ from urllib.parse import urlparse, unquote
 
 from bs4 import BeautifulSoup
 
-from http_client import session
+from http_client import third_party_session as session
 
 # Some careers pages return a stub or a 403 to a bare programmatic request.
 # The pages are public; this just looks like a browser so they answer

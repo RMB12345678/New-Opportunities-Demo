@@ -90,7 +90,8 @@ def job(url="http://acme/1", **overrides):
     return base
 
 
-def sync(existing_rows, jobs, scraped_ok=frozenset({ACME}), dry_run=False):
+def sync(existing_rows, jobs, scraped_ok=frozenset({ACME}), dry_run=False,
+         carry_new_ids=None):
     """Run sync_jobs_to_notion against stubbed Notion queries.
 
     Returns (result, writes, creates) where writes is a list of
@@ -118,7 +119,8 @@ def sync(existing_rows, jobs, scraped_ok=frozenset({ACME}), dry_run=False):
     nc.state = _StubState()
 
     result = nc.sync_jobs_to_notion(jobs, scraped_ok, dry_run=dry_run,
-                                    rubric_fingerprint="fp-old")
+                                    rubric_fingerprint="fp-old",
+                                    carry_new_ids=carry_new_ids)
     return result, writes, creates
 
 
@@ -353,7 +355,7 @@ def test_routing_change_that_is_real_still_writes():
 
 
 def test_missing_company_relation_is_not_cleared():
-    """A company absent from the Target List under this name must leave the
+    """A company absent from Companies under this name must leave the
     existing relation alone. Blanking it would put the row permanently
     beyond the close pass, which refuses to touch unresolved rows."""
     _, writes, _ = sync([jrow()], [job(company="Not In Target List")])
@@ -391,6 +393,29 @@ def test_dry_run_does_not_advance_saved_state():
 
     sync([jrow()], [job()], dry_run=False)
     assert nc.state.saved, "a real run must record its fingerprint and date"
+
+
+# --- carrying New This Run over an interrupted run --------------------
+
+def test_carried_row_keeps_new_this_run_through_update_and_reset():
+    """A run killed mid-sync leaves rows created and flagged. The re-run sees
+    them as existing and would clear the flag; a carried id must survive both
+    the update branch (row came back in the scrape) and the reset pass (row
+    did not), while an uncarried flagged row is still cleared."""
+    rows = [jrow(url="http://acme/1", pid="carried-seen", new_this_run=True),
+            jrow(url=None, pid="carried-unseen", new_this_run=True, company=None),
+            jrow(url=None, pid="stale", new_this_run=True, company=None)]
+    res, writes, _ = sync(rows, [job(url="http://acme/1")],
+                          carry_new_ids={"carried-seen", "carried-unseen"})
+    assert writes == [("stale", {"New This Run": "__NO__"})]
+
+
+def test_carried_row_still_cleared_when_it_closes():
+    """A closed posting is never new, so the close pass ignores the carry."""
+    rows = [jrow(url="http://acme/gone", pid="j1", new_this_run=True)]
+    res, writes, _ = sync(rows, [], carry_new_ids={"j1"})
+    closing = [p for pid, p in writes if pid == "j1"]
+    assert closing and closing[0]["New This Run"] == "__NO__"
 
 
 if __name__ == "__main__":

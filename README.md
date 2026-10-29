@@ -15,6 +15,22 @@ criteria; the keyword filters and code architecture are the same as the
 private version. Only the real company/application data has been
 removed — that stays in a private database, not committed here.*
 
+## Scale
+
+As of the 2026-10-26 run, against the private database this is a copy of:
+
+- **1,502 companies** tracked (medtech, digital health, healthcare-focused
+  PE/VC), of which 49 are in a separate "Large MedTech" tier. 946 scraped
+  cleanly on the last pass; the rest are surfaced in a Needs Manual Check
+  view instead of being silently dropped.
+- **11,057 job postings** in the database: 8,368 still open and 2,689
+  closed, with 1,892 of the open ones scored matches. That last run
+  handled 5,309 postings across 306 companies with open roles. A
+  steady-state run writes roughly a hundred rows to Notion rather than
+  all of them.
+- **13 ATS platforms** read through their public endpoints, and **204
+  offline tests**.
+
 ## What it does
 
 1. **Researches companies automatically.** Given just a company name, it
@@ -23,17 +39,24 @@ removed — that stays in a private database, not committed here.*
    collisions rather than guessing.
 2. **Scrapes job postings** — using real public APIs for companies on
    Greenhouse, Lever, Ashby, Workday, Workable, Personio, Breezy,
-   Rippling, Teamtailor, SmartRecruiters or Pinpoint, and a best-effort
+   Rippling, Teamtailor, SmartRecruiters or Pinpoint — plus Oracle Recruiting
+   Cloud and SuccessFactors, which are read from the saved careers URL
+   rather than a guessed slug — and a best-effort
    generic scraper for companies with in-house career pages. A page that
    only *looks* in-house is checked first for an ATS board it embeds,
    redirects to or links — but only when the page names exactly one, so a
    careers page listing a portfolio of other companies' boards is refused
-   rather than guessed at.
+   rather than guessed at. Companies in the "Large MedTech" tier (over $1B
+   revenue) are scraped in full but only their senior titles (VP, director,
+   head of, general manager, chief) are kept, scored and synced, so they
+   cannot flood the list.
 3. **Scores every posting** against a rubric (`scoring/rubric.md`) using
    Claude — the posting's own text, not just its title — batched and
    cached to keep API costs low. The cache is fingerprinted against the
-   rubric, so editing the rubric re-scores everything instead of serving
-   stale answers.
+   model, the keyword list and a scorer version, so changing any of those
+   re-scores everything instead of serving stale answers. Editing the rubric
+   itself applies going forward: only newly scored postings see the new
+   text, so a wording tweak never triggers a full re-score.
 4. **Syncs results to Notion**, deduplicated by URL, with dedicated views
    for new postings, scored matches, non-fits, applications sent, and the
    full list. A posting is only marked closed when its company actually
@@ -55,7 +78,7 @@ flowchart TD
     S3["Backfill missing Careers URL\nIf ATS already confirmed: search targets\nTHAT platform's URL pattern specifically\nFallback chain: dedicated page -> homepage -> Google search"] --> S4
 
     S4{"Scrape\nATS Platform?"}
-    S4 -->|One of eleven API-backed platforms| S4a["Hit real public API\nUse CONFIRMED slug from saved URL first,\nfall back to guessing from company name"]
+    S4 -->|One of thirteen API-backed platforms| S4a["Hit real public API\nUse CONFIRMED slug from saved URL first,\nfall back to guessing from company name"]
     S4 -->|HTML / in-house page| S4b["Look for an embedded ATS board first\n(redirect, embed or link — and only if the\npage names exactly one board)\nelse generic scraper: job-title-like link\ntext, filters nav/footer noise"]
     S4 -->|No ATS found / Ambiguous| S4c["Skipped -> Needs Manual Check"]
 
@@ -173,7 +196,7 @@ You'll need two Notion databases:
 
 **Target List** — Company (title), Sector / Focus (text), HQ (text),
 Source (text), ATS Platform (text), Scrape Method (text), Careers URL
-(URL type), Website (URL type), Jobs (relation → Job Postings), Scrape
+(URL type), Website (URL type), Company Tier (select, optional), Jobs (relation → Job Postings), Scrape
 Status (select: OK / Failed / No Scraper / No Careers URL), Scrape Note
 (text), Failing Since (date)
 
@@ -229,14 +252,16 @@ detected automatically.
 python -m pytest tests/
 ```
 
-The suite is offline — no network, no API keys, no Notion, and it stubs
+The suite (204 tests) is offline — no network, no API keys, no Notion, and it stubs
 the on-disk run state so a test run can never advance it. It covers the
 close-pass rules that decide whether a posting is retired (company-relation
 resolution, the scraped-successfully guard, the 25% ratio valve, its 20-row
 floor, the empty-database case), the delta sync and the comparison traps
 that would otherwise rewrite every row on every run, the one-row-per-URL
 rule and the "New This Run" reset, each ATS scraper's slug extraction and
-job-dict contract, embedded-board detection and its refusal to guess when a
+job-dict contract (including the URL-based Oracle and SuccessFactors scrapers
+and their refusal to report a false empty board), the Large MedTech senior-title
+filter, embedded-board detection and its refusal to guess when a
 page names several boards, and the checks that tell a never-researched field
 apart from one holding a wrong value.
 

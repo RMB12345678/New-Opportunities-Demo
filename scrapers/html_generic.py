@@ -26,15 +26,15 @@ silently breaks JOB_TITLE_HINTS' \b word-boundary check whenever the hint
 word is the last word of the title (i.e. most of the time) — the boundary
 after "Architect"/"Coordinator"/"Technician"/"Designer" only exists if
 what follows is non-word text (a space, a parenthesis), and a location
-name glued on with no separator is not that. On one medtech company's
-board this was undercounting its real 9 open roles to 3, invisibly — no exception, no
+name glued on with no separator is not that. This was undercounting
+INBRAIN's real 9 open roles down to 3, invisibly — no exception, no
 zero-jobs flag, just most titles failing to look like titles. It is a
 layout pattern common enough (Personio uses it; plenty of others do too)
 that this was very likely undercounting other HTML-scraped companies the
 same way, not just this one.
 
-Two more things were tightened at the same time, both discovered on that
-same board, both silent (no error, just a link that never made it
+Two more things were tightened at the same time, both discovered on the
+same INBRAIN board, both silent (no error, just a link that never made it
 into `jobs`):
 
   - JOB_TITLE_HINTS was missing "partner" ("Senior Talent Partner" matched
@@ -45,7 +45,7 @@ into `jobs`):
   - MAX_TITLE_LENGTH was 100, sized for a bare title. Now that the
     extracted text is title + location + employment type joined with
     spaces (see above), a real, single job can legitimately run past 100
-    — the longest on that board is 109. Raised to 160: generous enough to keep
+    — INBRAIN's longest is 109. Raised to 160: generous enough to keep
     "Title (parenthetical) City Full-time Permanent employee" shapes, not
     so generous that it starts accepting paragraph-length nav/footer text
     instead of a listing.
@@ -59,15 +59,15 @@ company-specific board (e.g. "https://jobs.workable.com" instead of
 no job-title-shaped links on it, and run.py's "zero jobs is a trustworthy
 success" rule (deliberate for a real company board that genuinely has no
 openings right now) then stamps it OK. That combination — plausible URL,
-wrong company, silent zero — is exactly what let one PE firm's Careers
-URL sit as "https://jobs.workable.com" reporting "HTML: 0 job(s)" instead of
+wrong company, silent zero — is exactly what let ARCHIMED's Careers URL
+sit as "https://jobs.workable.com" reporting "HTML: 0 job(s)" instead of
 ever surfacing in the Needs Manual Check view. _reject_bare_ats_domain
 catches this one shape by name: known multi-tenant ATS host, no
 company-specific path segment. It is deliberately narrow — it is not a
 general "zero jobs is suspicious" rule, which would fight the documented
 reason zero is trusted elsewhere.
 
-The fix above (widening JOB_TITLE_HINTS and MAX_TITLE_LENGTH) traded
+The INBRAIN fix above (widening JOB_TITLE_HINTS and MAX_TITLE_LENGTH) traded
 one failure mode for another. _generic_extract scans every <a> on the page
 for a hint word, with nothing requiring the link to actually sit inside a
 jobs listing — so a page containing any anchor whose text has "partner" or
@@ -75,34 +75,33 @@ jobs listing — so a page containing any anchor whose text has "partner" or
 the net made it worse, and the first run after that fix surfaced it: 7 of
 52 "new" postings were not jobs —
 
-  - Four company sites contributed a business-development CTA link —
-    "Become a partner", "Partner with Us", "Partner With Us", a bare
-    "Partner" — all caught directly by the new "partner" hint.
-  - Two investment firms contributed a press-release headline apiece,
-    of the "<Firm> appoints <Name> as Operating Partner" and "<Company>
-    Appoints Experienced Biotech Executive, Dr <Name>, as Chief Business
-    Officer..." shape, pulled off their /updates/ and /media/ sections.
-    Both are 130+ characters and would have been rejected under the old
-    100-char cap; raising it to 160 let them through.
-  - One more contributed two LinkedIn profile links ("Executive with 20+
-    years...") pulled off what's evidently a team/bio page, not a jobs
-    page.
+  - MYNERVA "Become a partner", Delfina "Partner with Us", Precision
+    Neuroscience "Partner With Us", Portal Instruments "Partner" — all
+    business-development CTA links, caught directly by the new "partner"
+    hint.
+  - GHO Capital "GHO Capital appoints Vivid Sehgal as Operating Partner"
+    and HealthCap "Priothera Appoints Experienced Biotech Executive, Dr
+    Nigel Clark, as Chief Business Officer..." — press-release headlines
+    from each firm's /updates/ and /media/ sections. Both are 130+
+    characters and would have been rejected under the old 100-char cap;
+    raising it to 160 let them through.
+  - Aurenar — two LinkedIn profile links ("Executive with 20+ years...")
+    pulled off what's evidently a team/bio page, not a jobs page.
 
 No title-text heuristic distinguishes "Senior Talent Partner" from "Become
 a partner" — both are short phrases containing the hint word "partner".
 The fix is two narrow, independent filters, neither of which loosens
-JOB_TITLE_HINTS or MAX_TITLE_LENGTH back down (that would re-break the
-undercounted board above):
+JOB_TITLE_HINTS or MAX_TITLE_LENGTH back down (that would re-break INBRAIN):
 
   - NAV_NOISE now also rejects a small set of known non-job CTA phrases
     ("partner", "partner with us", "become a partner") by exact match,
     the same way it already rejects "Careers" — these are common enough
     across company sites to name directly rather than pattern-match.
   - _looks_like_non_job_link rejects by the link's destination rather
-    than the anchor text: linkedin.com (never a job posting — the
-    Personio board above does carry other people's LinkedIn profiles in
-    its own links, but never with a JOB_TITLE_HINTS-shaped anchor text,
-    so this doesn't cost real postings there) and any URL whose path contains a /media/, /news/,
+    than the anchor text: linkedin.com (never a job posting — INBRAIN's
+    own board links do carry other people's LinkedIn profiles, but never
+    with a JOB_TITLE_HINTS-shaped anchor text, so this doesn't cost real
+    postings there) and any URL whose path contains a /media/, /news/,
     /press/, /updates/, or /blog/ segment — the shape a press release or
     company-news post lives at, and a shape a real job listing does not.
 """
@@ -110,7 +109,7 @@ import re
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 
-from http_client import session
+from http_client import third_party_session as session
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; MedTechTargetScraper/1.0)"}
 
@@ -179,8 +178,8 @@ NAV_NOISE = re.compile(
 
 # Link destinations that are never a job posting, whatever the anchor text
 # says — a press release, a news post, or a team bio page can easily
-# contain a JOB_TITLE_HINTS word (see the module docstring for the real
-# cases). Checked against the resolved href, not the visible
+# contain a JOB_TITLE_HINTS word (see module docstring: GHO Capital,
+# HealthCap, Aurenar). Checked against the resolved href, not the visible
 # text, so it catches these regardless of phrasing.
 NON_JOB_LINK_HOSTS = ("linkedin.com",)
 NON_JOB_LINK_PATH_SEGMENTS = frozenset({"media", "news", "press", "updates", "blog"})

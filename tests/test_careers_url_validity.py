@@ -41,8 +41,8 @@ from ats_finder.find_website import (
 def test_the_pasted_notion_link_is_rejected():
     """The actual value that was in twenty rows."""
     assert not is_usable_careers_url(
-        "https://app.notion.com/p/Some-Page-00000000000000000000000000000000"
-        "?v=00000000000000000000000000000000&source=copy_link")
+        "https://app.notion.com/p/PocDoc-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "?v=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx&source=copy_link")
 
 
 def test_document_hosts_are_rejected_including_subdomains():

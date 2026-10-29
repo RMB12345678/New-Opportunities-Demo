@@ -152,7 +152,7 @@ def _stub_patch(capture):
         ok = True
         def json(self):
             return {"id": "pg-1"}
-    def fake_patch(url, headers=None, json=None):
+    def fake_patch(url, headers=None, json=None, timeout=None):
         capture.append({"url": url, "json": json})
         return FakeResp()
     return fake_patch

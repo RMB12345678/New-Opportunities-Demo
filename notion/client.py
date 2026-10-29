@@ -1,11 +1,14 @@
 """
-Thin wrapper around the Notion API for the Target List database.
+Thin wrapper around the Notion API for the Companies database (renamed from
+"Target List" on 2026-09-10 — same database id, same data source, only the
+Notion display name changed; nothing here reads the name, so this file
+didn't need a functional change, just this comment sweep).
 
 Requires env var NOTION_API_KEY (a Notion internal integration token,
 created at https://www.notion.so/my-integrations, then shared with the
-Target List database via "Connections" in Notion's UI).
+Companies database via "Connections" in Notion's UI).
 
-Requires env var NOTION_DATABASE_ID (the ID of the Target List database,
+Requires env var NOTION_DATABASE_ID (the ID of the Companies database,
 found in its page URL).
 """
 import collections
@@ -23,6 +26,10 @@ NOTION_DATABASE_ID = os.environ["NOTION_DATABASE_ID"]
 JOB_POSTINGS_DATABASE_ID = os.environ["JOB_POSTINGS_DATABASE_ID"]
 NOTION_VERSION = "2022-06-28"
 
+# Seconds. The retry session only bounds a connect/read; with no timeout a
+# Notion call that never answers hangs the run indefinitely (see invariant 25).
+NOTION_TIMEOUT = 30
+
 # Close-pass safety valve. A single run closing more than this fraction of
 # everything currently open is a systemic failure, not real closures.
 CLOSE_VALVE_MAX_FRACTION = 0.25
@@ -35,7 +42,7 @@ CLOSE_VALVE_MAX_FRACTION = 0.25
 # inside the limit, so the valve only speaks up about genuine clusters.
 CLOSE_VALVE_MIN_OPEN_ROWS = 20
 
-# Scrape Status values stamped onto every Target List row after each run.
+# Scrape Status values stamped onto every Companies row after each run.
 # Anything other than SCRAPE_OK means no technique reached that company's
 # postings, and those rows are what the "Needs Manual Check" view in Notion
 # filters for. They are deliberately coarse: the Scrape Note carries the
@@ -104,10 +111,10 @@ def _raise_with_detail(resp):
 
 
 def get_all_companies():
-    """Return every row in the Target List database as a list of dicts:
+    """Return every row in the Companies database as a list of dicts:
     [{page_id, company, sector, hq, source, ats_platform, scrape_method,
       careers_url, scrape_status, scrape_note, failing_since, website,
-      has_icon}, ...]
+      has_icon, tier}, ...]
     """
     rows = []
     payload = {"page_size": 100}
@@ -115,7 +122,7 @@ def get_all_companies():
 
     while True:
         _count("read:target_list_page")
-        resp = session.post(url, headers=HEADERS, json=payload)
+        resp = session.post(url, headers=HEADERS, json=payload, timeout=NOTION_TIMEOUT)
         _raise_with_detail(resp)
         data = resp.json()
 
@@ -136,6 +143,10 @@ def get_all_companies():
                 "scrape_note": _plain_text(props.get("Scrape Note")),
                 "failing_since": _date_start(props.get("Failing Since")),
                 "website": _url_value(props.get("Website")),
+                # Select; None when blank OR when the property doesn't exist
+                # (_select_name tolerates both). "Large MedTech" switches on
+                # the senior-title filter in run.py.
+                "tier": _select_name(props.get("Company Tier")),
                 # Page-level, not a property — see
                 # get_companies_missing_website()'s docstring for why this
                 # is read here rather than derived from "website" alone.
@@ -188,13 +199,13 @@ def get_companies_missing_url():
     Selects on is_usable_careers_url() rather than on a blank field.
     "Blank means never researched" (invariant 8) is a good test for a field
     whose wrong answers are still answers, and no test at all for one
-    holding something that was never an answer: a batch of rows carried a
-    pasted Notion link here, and because the field was non-blank this pass
-    skipped them on every run while the scrape retried and failed on every
-    run. The predicate is structural and makes no network call, so a URL
-    that is merely stale or unreachable still passes — that is a scrape
-    failure, which sync_scrape_status() already surfaces, and judging
-    liveness here would collide with invariant 1."""
+    holding something that was never an answer: twenty rows carried a
+    pasted `app.notion.com` link here, and because the field was non-blank
+    this pass skipped them on every run while the scrape retried and failed
+    on every run. The predicate is structural and makes no network call, so
+    a URL that is merely stale or unreachable still passes — that is a
+    scrape failure, which sync_scrape_status() already surfaces, and
+    judging liveness here would collide with invariant 1."""
     return [
         row for row in get_all_companies()
         if row["ats_platform"]
@@ -272,7 +283,7 @@ def update_company_website(page_id, website=None, icon=None, dry_run=False):
               f"website={website!r} icon={'set' if icon else None}")
         return None
 
-    resp = session.patch(f"{BASE_URL}/pages/{page_id}", headers=HEADERS, json=payload)
+    resp = session.patch(f"{BASE_URL}/pages/{page_id}", headers=HEADERS, json=payload, timeout=NOTION_TIMEOUT)
     _raise_with_detail(resp)
     return resp.json()
 
@@ -315,7 +326,7 @@ def update_company_info(page_id, sector=None, hq=None, source=None,
         return None
 
     payload = {"properties": properties}
-    resp = session.patch(url, headers=HEADERS, json=payload)
+    resp = session.patch(url, headers=HEADERS, json=payload, timeout=NOTION_TIMEOUT)
     _raise_with_detail(resp)
     return resp.json()
 
@@ -329,7 +340,7 @@ def update_ats_fields(page_id, ats_platform, scrape_method, careers_url=None, dr
 
 
 def sync_scrape_status(statuses, dry_run=False):
-    """Stamp every Target List row with how this run's scrape of it went.
+    """Stamp every Companies row with how this run's scrape of it went.
 
     `statuses` is what run_scrapers() collected: one record per company,
     holding the row it came from, the outcome, and a note explaining it.
@@ -399,7 +410,7 @@ def sync_scrape_status(statuses, dry_run=False):
 
 
 def _write_scrape_status(page_id, status, note, failing_since, dry_run=False):
-    """Write the three Scrape Status properties onto one Target List page.
+    """Write the three Scrape Status properties onto one Companies page.
 
     Scrape Status is a Notion select, so the value has to be one of the
     options defined on the property — the SCRAPE_* constants above are those
@@ -422,7 +433,7 @@ def _write_scrape_status(page_id, status, note, failing_since, dry_run=False):
         return None
 
     resp = session.patch(f"{BASE_URL}/pages/{page_id}", headers=HEADERS,
-                         json={"properties": properties})
+                         json={"properties": properties}, timeout=NOTION_TIMEOUT)
     _raise_with_detail(resp)
     return resp.json()
 
@@ -576,8 +587,8 @@ def _changed_job_properties(job, row, company_page_id):
     if row.get("new_this_run"):
         changed["New This Run"] = "__NO__"
 
-    # A missing company_page_id means the company isn't in the Target List
-    # under this name. Leave the existing relation alone rather than
+    # A missing company_page_id means the company isn't in the Companies
+    # database under this name. Leave the existing relation alone rather than
     # clearing it: an unresolved relation is what stops the close pass
     # touching a row, so silently blanking one would put a live posting
     # permanently beyond the reach of both passes.
@@ -618,11 +629,18 @@ def _log_planned_write(page_id, properties, reason):
     print(f"     [dry-run] WRITE {page_id}  fields={sorted(properties)}  reason={reason}")
 
 
-def sync_jobs_to_notion(jobs, scraped_ok, dry_run=False, rubric_fingerprint=None):
+def sync_jobs_to_notion(jobs, scraped_ok, dry_run=False, rubric_fingerprint=None,
+                        carry_new_ids=None):
     """Write scored jobs to the Job Postings Notion database, deduped by URL.
 
+    carry_new_ids is a one-off: page ids of rows an earlier, interrupted run
+    created and flagged New This Run. This run would otherwise read them as
+    existing rows and clear the flag, so they would never be seen as new.
+    Listed rows keep the flag through the update branch and the reset pass;
+    the close pass still clears it, since a closed row is never new.
+
     - New URL -> create a row, First Seen = today, linked to the matching
-      Target List company via the Company relation.
+      Companies row via the Company relation.
     - Known URL -> compare every property this pipeline owns against what
       Notion already holds, and PATCH only the ones that actually moved.
       A row with nothing new to say costs zero writes.
@@ -647,7 +665,7 @@ def sync_jobs_to_notion(jobs, scraped_ok, dry_run=False, rubric_fingerprint=None
     0.35s throttle sleep, so the sync alone took about half an hour and
     grew linearly with the table — while writing byte-identical values to
     roughly 3,150 of those rows. sync_scrape_status() had already learned
-    this lesson on the Target List; the reasoning just never got carried
+    this lesson on Companies; the reasoning just never got carried
     across to Job Postings.
 
     The diff compares against Notion's own state, not a local mirror.
@@ -686,7 +704,7 @@ def sync_jobs_to_notion(jobs, scraped_ok, dry_run=False, rubric_fingerprint=None
     # itself immediately afterwards.
     last_seen_on_close = saved_state.get("last_run") or today
 
-    # Target List has to be fetched first now: _query_all_job_postings()
+    # Companies has to be fetched first now: _query_all_job_postings()
     # needs this map to resolve each row's Company relation to a name,
     # which is what the close pass gates on.
     company_pages = _query_all_target_list_pages()
@@ -719,12 +737,11 @@ def sync_jobs_to_notion(jobs, scraped_ok, dry_run=False, rubric_fingerprint=None
               f"sharing a URL with another row. Only one row per URL can be kept "
               f"up to date; the extras are unreachable and want archiving by hand.")
 
-    # Application Status is set by hand in Notion; a real "stamp the date
-    # the moment the status changes" automation is a Notion database
-    # automation and needs a paid plan, so this is the free substitute:
-    # it lands on the next run rather than instantly. Runs against every
+    # The owner sets Application Status by hand in Notion; a real "stamp the date
+    # the moment the status changes" automation needs a paid Notion plan
+    # (see punch list), so this is the free substitute. Runs against every
     # row Notion currently holds, not just this run's scrape, so it still
-    # catches a posting marked Applied after it has already closed and
+    # catches a posting the owner marks Applied after it has already closed and
     # stopped showing up here, which the create/update loop below would
     # otherwise never revisit.
     date_applied_backfilled = _backfill_applied_dates(existing, today, dry_run=dry_run)
@@ -739,6 +756,10 @@ def sync_jobs_to_notion(jobs, scraped_ok, dry_run=False, rubric_fingerprint=None
     # stuck, and the reset pass retrying just the checkbox is the right
     # outcome, not a double write.
     flag_cleared = set()
+    carry_new_ids = set(carry_new_ids or ())
+    if carry_new_ids:
+        print(f"     [carry] keeping New This Run ticked on up to {len(carry_new_ids)} "
+              f"row(s) created by an interrupted earlier run")
 
     for job in jobs:
         url = job.get("url")
@@ -790,6 +811,8 @@ def sync_jobs_to_notion(jobs, scraped_ok, dry_run=False, rubric_fingerprint=None
                 created += 1
             else:
                 changed = _changed_job_properties(job, row, company_page_id)
+                if row["page_id"] in carry_new_ids:
+                    changed.pop("New This Run", None)
                 # Backfill: an existing row with no icon yet gets one copied
                 # over from its company, even on a run where nothing else
                 # about it changed — otherwise every job created before this
@@ -840,7 +863,7 @@ def sync_jobs_to_notion(jobs, scraped_ok, dry_run=False, rubric_fingerprint=None
             continue
         company = row.get("company")
         if company is None:
-            # No Company relation at all, or one pointing at a Target List
+            # No Company relation at all, or one pointing at a Companies
             # page that no longer exists. Unknown provenance: we cannot
             # confirm this company's scrape succeeded, and defaulting to
             # close on an unconfirmed answer is the original bug. Tracked
@@ -944,7 +967,8 @@ def sync_jobs_to_notion(jobs, scraped_ok, dry_run=False, rubric_fingerprint=None
     # write per row the previous run created, which is the same handful
     # the update branch was already paying for.
     stuck = [row for row in existing
-             if row.get("new_this_run") and row["page_id"] not in flag_cleared]
+             if row.get("new_this_run") and row["page_id"] not in flag_cleared
+             and row["page_id"] not in carry_new_ids]
     unflagged = 0
     for row in stuck:
         try:
@@ -1015,7 +1039,7 @@ def _print_close_candidates(to_close, left_open_failed, left_open_unresolved):
 def _query_all_job_postings(company_name_by_page_id=None):
     """Read every Job Postings row.
 
-    company_name_by_page_id maps Target List page ids to company names;
+    company_name_by_page_id maps Companies page ids to company names;
     pass it and each row comes back with a resolved "company". The close
     pass needs to know which company a row belongs to before it can decide
     whether that company's scrape succeeded, and it matches on the
@@ -1025,7 +1049,7 @@ def _query_all_job_postings(company_name_by_page_id=None):
     provenance and never closes.
 
     The lookup is passed in rather than fetched here because
-    sync_jobs_to_notion() already queries the Target List for the reverse
+    sync_jobs_to_notion() already queries Companies for the reverse
     map — re-querying would add a fourth full table scan to a run that
     already does too many (punch list #12)."""
     rows, cursor = [], None
@@ -1035,7 +1059,7 @@ def _query_all_job_postings(company_name_by_page_id=None):
         if cursor:
             payload["start_cursor"] = cursor
         _count("read:job_postings_page")
-        resp = session.post(url, headers=HEADERS, json=payload)
+        resp = session.post(url, headers=HEADERS, json=payload, timeout=NOTION_TIMEOUT)
         _raise_with_detail(resp)
         data = resp.json()
         for page in data["results"]:
@@ -1076,7 +1100,7 @@ def _query_all_job_postings(company_name_by_page_id=None):
 
 
 def _backfill_applied_dates(existing_rows, today, dry_run=False):
-    """Application Status is set by hand in Notion. Stamping Date Applied
+    """The owner sets Application Status by hand in Notion. Stamping Date Applied
     the instant that happens is a real Notion database automation, but
     those need a paid Notion plan — this is the free substitute. Once a
     run notices Application Status = "Applied" with Date Applied still
@@ -1084,12 +1108,12 @@ def _backfill_applied_dates(existing_rows, today, dry_run=False):
 
     Runs against every row Notion currently holds (existing_rows, from
     _query_all_job_postings), not just this run's scrape — so it still
-    catches a posting marked Applied after it has already closed and
+    catches a posting the owner marks Applied after it has already closed and
     stopped showing up in the scrape, which the main create/update loop
     above would otherwise never revisit.
 
     Only ever fills a blank Date Applied. A row already carrying a date —
-    whether typed in by hand or stamped by a previous run — is left
+    whether the owner typed it in or a previous run stamped it — is left
     alone, and no other Application Status value is touched."""
     backfilled = 0
     for row in existing_rows:
@@ -1116,7 +1140,7 @@ def _query_all_target_list_pages():
         if cursor:
             payload["start_cursor"] = cursor
         _count("read:target_list_page")
-        resp = session.post(url, headers=HEADERS, json=payload)
+        resp = session.post(url, headers=HEADERS, json=payload, timeout=NOTION_TIMEOUT)
         _raise_with_detail(resp)
         data = resp.json()
         for page in data["results"]:
@@ -1152,7 +1176,7 @@ def _create_job_posting(properties, icon_url=None, dry_run=False):
                "properties": _build_job_properties(properties)}
     if icon_url:
         payload["icon"] = {"type": "external", "external": {"url": icon_url}}
-    resp = session.post(url, headers=HEADERS, json=payload)
+    resp = session.post(url, headers=HEADERS, json=payload, timeout=NOTION_TIMEOUT)
     _raise_with_detail(resp)
     time.sleep(0.35)  # stay under Notion's ~3 req/s limit instead of retrying 429s after the fact
     return resp.json()
@@ -1166,7 +1190,7 @@ def _update_job_posting(page_id, properties, icon_url=None, dry_run=False):
     payload = {"properties": _build_job_properties(properties)}
     if icon_url:
         payload["icon"] = {"type": "external", "external": {"url": icon_url}}
-    resp = session.patch(url, headers=HEADERS, json=payload)
+    resp = session.patch(url, headers=HEADERS, json=payload, timeout=NOTION_TIMEOUT)
     _raise_with_detail(resp)
     time.sleep(0.35)
     return resp.json()

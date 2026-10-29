@@ -29,3 +29,22 @@ _retry = Retry(
 session = requests.Session()
 session.mount("https://", HTTPAdapter(max_retries=_retry))
 session.mount("http://", HTTPAdapter(max_retries=_retry))
+
+# For fetching arbitrary company websites (ats_finder/find_embedded_board.py,
+# scrapers/html_generic.py), not an API we have a relationship with. The patient
+# session above honours Retry-After, and a site answering 429/503 with a huge
+# value makes urllib3 sleep for that long inside Retry.sleep_for_retry — a sleep
+# the request timeout does not cover. One froze a run for ~3 hours; Sonivie
+# answers 503 with Retry-After: 600. respect_retry_after_header=False means only
+# our own backoff_factor decides how long to wait (invariant 25).
+_third_party_retry = Retry(
+    total=2,
+    backoff_factor=1,
+    status_forcelist=[429, 502, 503, 504],
+    allowed_methods=["GET"],
+    respect_retry_after_header=False,
+)
+
+third_party_session = requests.Session()
+third_party_session.mount("https://", HTTPAdapter(max_retries=_third_party_retry))
+third_party_session.mount("http://", HTTPAdapter(max_retries=_third_party_retry))

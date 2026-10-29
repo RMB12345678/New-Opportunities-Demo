@@ -4,8 +4,8 @@ The heuristic extractor can't tell "this page genuinely has zero openings"
 from "this page isn't the company's board at all" — both look like zero
 matched job-title links. run.py deliberately trusts a zero-job result as a
 real SCRAPE_OK (see its docstring), which is correct for the first case and
-wrong for the second. One PE firm's Careers URL sat at "https://jobs.workable.com"
-(Workable's own generic domain, not that firm's board) for a week, stamped OK
+wrong for the second. ARCHIMED's Careers URL sat at "https://jobs.workable.com"
+(Workable's own generic domain, not ARCHIMED's board) for a week, stamped OK
 with "HTML: 0 job(s)", because nothing distinguished the two cases.
 
 _reject_bare_ats_domain narrows that gap for one concrete, checkable shape:
@@ -20,8 +20,8 @@ location, employment type — a layout Personio and others use) with no
 space, so "Data Architect" next to "Barcelona" became the single run
 "Data ArchitectBarcelona" and silently broke the \b word-boundary check
 in JOB_TITLE_HINTS whenever the hint word was the title's last word. On
-one medtech company's real Personio-hosted board (verified live) this
-undercounted the open roles to 3 — not an exception, not a zero-jobs flag, just most
+INBRAIN's real Personio-hosted board (verified live: 9 open roles) this
+undercounted to 3 — not an exception, not a zero-jobs flag, just most
 titles no longer looking like titles.
 
 Fixing the separator alone still left 2 of those 9 uncaught, both flagged
@@ -49,11 +49,11 @@ from scrapers import html_generic
 # --- the bare-ATS-domain guard ---------------------------------------------
 
 def test_bare_workable_domain_is_rejected():
-    """The exact real-world shape: Workable's own domain, no company slug."""
+    """The exact ARCHIMED shape: Workable's own domain, no company slug."""
     try:
-        html_generic.fetch_jobs("Acme Capital", "https://jobs.workable.com")
+        html_generic.fetch_jobs("ARCHIMED", "https://jobs.workable.com")
     except ValueError as e:
-        assert "Acme Capital" in str(e)
+        assert "ARCHIMED" in str(e)
         assert "workable.com" in str(e)
     else:
         raise AssertionError("a bare ATS domain must raise, not scrape to zero")
@@ -61,7 +61,7 @@ def test_bare_workable_domain_is_rejected():
 
 def test_bare_domain_with_trailing_slash_is_still_rejected():
     try:
-        html_generic.fetch_jobs("Acme Capital", "https://jobs.workable.com/")
+        html_generic.fetch_jobs("ARCHIMED", "https://jobs.workable.com/")
     except ValueError:
         pass
     else:
@@ -71,7 +71,7 @@ def test_bare_domain_with_trailing_slash_is_still_rejected():
 def test_company_specific_workable_url_is_not_rejected():
     """apply.workable.com/<company>/ is a real board and must reach the
     fetch step (and therefore the stubbed session), not raise."""
-    jobs = run_fetch("Acme Capital", "https://apply.workable.com/acmecapital/", html="<html></html>")
+    jobs = run_fetch("ARCHIMED", "https://apply.workable.com/archimed/", html="<html></html>")
     assert jobs == []
 
 
@@ -155,7 +155,7 @@ def test_genuinely_empty_board_returns_empty_not_an_error():
     assert jobs == []
 
 
-# --- adjacent-element text joining (the run-on title bug) -----------------
+# --- adjacent-element text joining (the INBRAIN bug) ------------------------
 
 def _personio_style_link(job_id, title, location="Barcelona",
                           employment="Full-time", contract="Permanent employee"):
@@ -170,8 +170,8 @@ def _personio_style_link(job_id, title, location="Barcelona",
 
 
 def test_adjacent_elements_dont_run_words_together():
-    """Reproduces a real Personio board's shape (verified live, Sep 2026):
-    every open role on it, in the exact title text it uses. Before the
+    """Reproduces INBRAIN's real board shape (verified live, Sep 2026):
+    all 9 open roles, in the exact title text INBRAIN uses. Before the
     separator fix, 6 of 9 lost their hint word to the glued-on location.
     Before the hint-list and length-cap fixes, "Senior Talent Partner" and
     the longest title were still dropped even with the separator fixed.
@@ -192,12 +192,12 @@ def test_adjacent_elements_dont_run_words_together():
     html = "<html><body>" + "".join(
         _personio_style_link(1000 + i, t) for i, t in enumerate(titles)
     ) + "</body></html>"
-    jobs = run_fetch("Acme Neurotech", "https://acme-neurotech.jobs.personio.com/?language=en", html)
+    jobs = run_fetch("INBRAIN", "https://inbrain-neuroelectronics.jobs.personio.com/?language=en", html)
     found_titles = {j["title"] for j in jobs}
     for t in titles:
         assert any(t in found for found in found_titles), f"missing: {t}"
     assert len(jobs) == len(titles), (
-        f"expected all {len(titles)} roles, got {len(jobs)}: {sorted(found_titles)}")
+        f"expected all {len(titles)} INBRAIN roles, got {len(jobs)}: {sorted(found_titles)}")
 
 
 def test_title_and_location_are_not_glued_together():
@@ -205,7 +205,7 @@ def test_title_and_location_are_not_glued_together():
     'Barcelona' become one word and the hint regex can't see 'Architect'
     as a whole word anymore."""
     html = "<html><body>" + _personio_style_link(1, "Data Architect") + "</body></html>"
-    jobs = run_fetch("Acme Neurotech", "https://acme-neurotech.example.com/careers", html)
+    jobs = run_fetch("INBRAIN", "https://inbrain.example.com/careers", html)
     assert len(jobs) == 1
     assert "ArchitectBarcelona" not in jobs[0]["title"]
     assert "Architect" in jobs[0]["title"]
@@ -213,7 +213,7 @@ def test_title_and_location_are_not_glued_together():
 
 def test_partner_is_a_recognized_title_word():
     html = "<html><body>" + _personio_style_link(1, "Senior Talent Partner") + "</body></html>"
-    jobs = run_fetch("Acme Neurotech", "https://acme-neurotech.example.com/careers", html)
+    jobs = run_fetch("INBRAIN", "https://inbrain.example.com/careers", html)
     assert len(jobs) == 1
 
 
@@ -231,11 +231,11 @@ def test_partners_nav_link_is_still_not_matched():
 
 
 def test_long_concatenated_title_is_no_longer_rejected():
-    """That board's longest title + location + employment type runs to 109
+    """INBRAIN's longest title + location + employment type runs to 109
     characters — past the old 100-char cap, under the new one."""
     long_title = "Machine Learning Operations Architect (with medical device experience)"
     html = "<html><body>" + _personio_style_link(1, long_title) + "</body></html>"
-    jobs = run_fetch("Acme Neurotech", "https://acme-neurotech.example.com/careers", html)
+    jobs = run_fetch("INBRAIN", "https://inbrain.example.com/careers", html)
     assert len(jobs) == 1
     assert len(jobs[0]["title"]) > 100
 
@@ -256,66 +256,66 @@ def test_length_cap_still_rejects_paragraph_length_text():
 
 # --- non-job false positives (the "partner" widening's fallout) ------------
 #
-# The first real run after that fix (widened JOB_TITLE_HINTS and
-# MAX_TITLE_LENGTH) surfaced 7 non-jobs in the same pass: four company
-# sites' "partner" business-development CTA links; two investment firms'
-# press-release headlines; and two team-bio LinkedIn links from a third.
-# These tests reproduce each exact shape, with the companies anonymized.
+# The first real run after the INBRAIN fix (widened JOB_TITLE_HINTS and
+# MAX_TITLE_LENGTH) surfaced 7 non-jobs in the same pass: MYNERVA, Delfina,
+# Precision Neuroscience, and Portal Instruments' "partner" business-dev CTA
+# links; GHO Capital's and HealthCap's press-release headlines; and two of
+# Aurenar's team-bio LinkedIn links. These tests reproduce each exact shape.
 
 def test_bare_partner_cta_is_rejected():
-    """A real link shape: the anchor text is just 'Partner'."""
+    """Portal Instruments' real link: the anchor text is just 'Partner'."""
     html = '<html><body><a href="/partner">Partner</a></body></html>'
-    jobs = run_fetch("Acme Instruments", "https://acmeinstruments.com/careers", html)
+    jobs = run_fetch("Portal Instruments", "https://portalinstruments.com/careers", html)
     assert jobs == []
 
 
 def test_partner_with_us_cta_is_rejected():
-    """Two companies' real link text (same phrase, different
-    capitalization — NAV_NOISE is case-insensitive)."""
+    """Delfina's and Precision Neuroscience's real link text (same phrase,
+    different capitalization — NAV_NOISE is case-insensitive)."""
     html = ('<html><body>'
             '<a href="/partner-with-us">Partner with Us</a>'
             '<a href="/partner-with-us">Partner With Us</a>'
             '</body></html>')
-    jobs = run_fetch("Acme Digital Health", "https://acmedigitalhealth.com/careers", html)
+    jobs = run_fetch("Delfina", "https://delfina.com/careers", html)
     assert jobs == []
 
 
 def test_become_a_partner_cta_is_rejected():
-    """A third company's real link text."""
+    """MYNERVA's real link text."""
     html = '<html><body><a href="/become-partner">Become a partner</a></body></html>'
-    jobs = run_fetch("Acme Devices", "https://acmedevices.com/careers", html)
+    jobs = run_fetch("MYNERVA", "https://mynerva.com/careers", html)
     assert jobs == []
 
 
 def test_press_release_link_is_rejected_by_url_even_with_hint_words():
-    """Two investment firms' real links: the anchor text is a news
+    """GHO Capital's and HealthCap's real links: the anchor text is a news
     headline containing hint words ('Partner', 'Executive', 'Officer'), long
     enough to pass MAX_TITLE_LENGTH and NOT an exact NAV_NOISE phrase — only
     the /updates/ and /media/ URL shape catches these."""
     html = (
         '<html><body>'
-        '<a href="/updates/acme-growth-partners-appoints-operating-partner/">'
-        'Acme Growth Partners appoints Dana Whitfield as Operating Partner</a>'
-        '<a href="/media/acme-bio-appoints-biotech-executive-as-cbo/">'
-        'Acme Bio Appoints Experienced Biotech Executive, Dr Alex Rivera, as Chief '
-        'Business Officer to Lead Strategic Partnering for its lead program</a>'
+        '<a href="/updates/gho-capital-appoints-vivid-sehgal-as-operating-partner/">'
+        'GHO Capital appoints Vivid Sehgal as Operating Partner</a>'
+        '<a href="/media/priothera-appoints-biotech-executive-dr-nigel-clark-as-cbo/">'
+        'Priothera Appoints Experienced Biotech Executive, Dr Nigel Clark, as Chief '
+        'Business Officer to Lead Strategic Partnering for Mocravimod</a>'
         '</body></html>'
     )
-    jobs = run_fetch("Acme Growth Partners", "https://acmegrowth.com/careers", html)
+    jobs = run_fetch("GHO Capital Partners", "https://ghocapital.com/careers", html)
     assert jobs == []
 
 
 def test_linkedin_profile_link_is_rejected_even_with_hint_words():
-    """A real link shape: a team/bio page linking out to LinkedIn
+    """Aurenar's real links: a team/bio page linking out to LinkedIn
     profiles, where the bio blurb itself contains 'Executive'."""
     html = (
         '<html><body>'
-        '<a href="https://www.linkedin.com/in/example-profile-b1a5/">'
+        '<a href="https://www.linkedin.com/in/jeff-caputo-b1a53517/">'
         'Executive with 20+ years of medical device experience in strategy, '
         'business development, operations and commercialization</a>'
         '</body></html>'
     )
-    jobs = run_fetch("Acme Advisors", "https://acmeadvisors.com/careers", html)
+    jobs = run_fetch("Aurenar", "https://aurenar.com/careers", html)
     assert jobs == []
 
 
@@ -324,7 +324,7 @@ def test_non_job_link_filters_dont_cost_real_postings():
     segments — a real posting whose title happens to contain 'partner', on
     an ordinary /jobs/ URL, must still come through."""
     html = '<html><body><a href="/jobs/42">Senior Talent Partner</a></body></html>'
-    jobs = run_fetch("Acme Neurotech", "https://acme-neurotech.example.com/careers", html)
+    jobs = run_fetch("INBRAIN", "https://inbrain.example.com/careers", html)
     assert len(jobs) == 1
     assert jobs[0]["title"] == "Senior Talent Partner"
 

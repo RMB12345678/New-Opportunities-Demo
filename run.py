@@ -2,7 +2,7 @@
 Main entry point.
 
 Run order (this is the "check before run" step you asked for):
-  1. Pull every company from the Notion Target List database.
+  1. Pull every company from the Notion Companies database.
   2. Find any rows where ATS Platform is blank (e.g. a company you just
      added manually). For each one, auto-search for its ATS and write
      the result back to Notion BEFORE the scrape step runs, so newly
@@ -47,8 +47,10 @@ from ats_finder.find_website import derive_website
 from ats_finder.find_embedded_board import detect_embedded_board
 from scrapers import (
     greenhouse, lever, ashby, workday, workable, personio, breezy,
-    rippling, teamtailor, smartrecruiters, pinpoint, html_generic,
+    rippling, teamtailor, smartrecruiters, pinpoint, html_generic, oracle_rc,
+    successfactors,
 )
+from scrapers.common import SENIOR_SEARCH_TERMS
 from scoring.score_jobs import score_all, RUBRIC_FINGERPRINT
 from scoring.track_new_postings import mark_new_postings
 from output_excel import build_workbook
@@ -107,7 +109,52 @@ def print_api_report(dry_run=False):
     print(f"  {'~throttle cost of writes':<28} {report['write_total'] * 0.35:6.0f}s")
 
 
-# Keyed by the platform name as it is written in the Target List "ATS
+# --- Large MedTech tier ---------------------------------------------------
+# Companies whose Company Tier is "Large MedTech" (>$1B revenue) are scraped
+# in full but only SENIOR postings are kept, scored and synced: a board of
+# several thousand roles would otherwise bury the 400-odd companies this
+# pipeline exists for. Edit the regex here to widen or narrow what counts.
+# "director" already covers Senior/Sr./Associate Director; "head of",
+# "general manager" and "chief" are there for the rubric's target titles
+# (Head of Product, GM North America, CCO).
+LARGE_MEDTECH_TIER = "Large MedTech"
+SENIOR_TITLE_RE = re.compile(
+    r"\b(vp|svp|vice president|director|head of|general manager|chief)\b",
+    re.IGNORECASE,
+)
+
+
+def prepare_jobs(row, jobs):
+    """Stamp company context onto a scraped company's jobs and, for the
+    Large MedTech tier only, drop everything that is not a senior title.
+
+    Every branch of run_scrapers() that extends all_jobs goes through here,
+    so the filter cannot be forgotten by one of them. It has to run BEFORE
+    all_jobs.extend(): mark_new_postings(), score_all() and
+    sync_jobs_to_notion() all consume that list, and a filtered-out role
+    that got past this point would be scored (money) and written to Notion
+    (clutter) before anything could remove it.
+
+    The tier is copied onto each job so the scorer can tell the model the
+    company is a >$1B business — the rubric's must-have is $10M-$150M
+    revenue, so without that line a VP role at a $30B company is scored as
+    if the company were simply a poor fit. Non-tier jobs carry no tier
+    key, so their scoring message is byte-identical to before and their
+    cached scores stay valid.
+    """
+    tier = row.get("tier")
+    for job in jobs:
+        job["company_description"] = row.get("sector")
+        if tier:
+            job["company_tier"] = tier
+    if tier != LARGE_MEDTECH_TIER:
+        return jobs
+    kept = [j for j in jobs if SENIOR_TITLE_RE.search(j.get("title") or "")]
+    print(f"[scrape] {row['company']}: kept {len(kept)} of {len(jobs)} (senior filter)")
+    return kept
+
+
+# Keyed by the platform name as it is written in the Companies "ATS
 # Platform" field. resolve_scraper() matches these whole-word and
 # case-insensitively, so the key has to be the shortest form that is still
 # unambiguous: "Breezy" (not "Breezy HR") because both spellings appear in
@@ -124,6 +171,28 @@ SCRAPERS = {
     "Teamtailor": teamtailor.fetch_jobs,
     "SmartRecruiters": smartrecruiters.fetch_jobs,
     "Pinpoint": pinpoint.fetch_jobs,
+    "Oracle Recruiting Cloud": oracle_rc.fetch_jobs,
+    "SuccessFactors": successfactors.fetch_jobs,
+}
+
+# Platforms whose scraper is `fetch_jobs(company_name, careers_url)` rather
+# than `fetch_jobs(company_name, slug=None)`: a board here is a host plus a
+# site or tenant, not one slug, so there is nothing to extract_slug() and —
+# like Workday — nothing safe to guess from the company name. run_scrapers()
+# hands them the saved Careers URL and has no guessed-slug fallback; a
+# missing or unreadable URL is flagged for a human. Workday is NOT in this
+# set: it predates it and takes pre-parsed board parameters in its own
+# branch. A platform only resolves once its scraper is in SCRAPERS.
+URL_BASED_PLATFORMS = {"Oracle Recruiting Cloud", "SuccessFactors"}
+
+# Other spellings of a platform that the research step writes into ATS
+# Platform. resolve_scraper() matches the canonical names in SCRAPERS
+# whole-word; this adds the text that would not contain them. "Oracle Taleo"
+# is deliberately NOT an alias of Oracle Recruiting Cloud — Taleo is a
+# different product with a different API, and no Taleo scraper exists.
+PLATFORM_ALIASES = {
+    "Oracle Recruiting Cloud": ["Oracle Cloud HCM", "Oracle Recruiting", "Oracle HCM"],
+    "SuccessFactors": ["SAP SuccessFactors"],
 }
 
 
@@ -430,7 +499,9 @@ def resolve_scraper(platform_raw):
 
     matches = []
     for name, fn in SCRAPERS.items():
-        if re.search(rf"\b{re.escape(name)}\b", platform_raw, re.IGNORECASE):
+        spellings = [name] + PLATFORM_ALIASES.get(name, [])
+        if any(re.search(rf"\b{re.escape(sp)}\b", platform_raw, re.IGNORECASE)
+               for sp in spellings):
             matches.append((name, fn))
 
     if not matches:
@@ -650,9 +721,12 @@ def run_scrapers(companies):
                            f"page) and save it instead.")
                 continue
             try:
-                jobs = workday.fetch_jobs(row["company"], **params)
-                for job in jobs:
-                    job["company_description"] = row.get("sector")
+                # Large MedTech boards run to thousands of postings and only
+                # senior titles are kept, so ask for those instead of paging
+                # the whole board.
+                terms = SENIOR_SEARCH_TERMS if row.get("tier") == LARGE_MEDTECH_TIER else None
+                jobs = workday.fetch_jobs(row["company"], search_terms=terms, **params)
+                jobs = prepare_jobs(row, jobs)
                 all_jobs.extend(jobs)
                 scraped_ok.add(row["company"])
                 filtered = " filtered to this company" if params["applied_facets"] else ""
@@ -662,6 +736,28 @@ def run_scrapers(companies):
             except Exception as error:
                 print(f"[scrape] {row['company']}: FAILED ({error})")
                 record(row, SCRAPE_FAILED, f"Workday: {error}")
+            continue
+
+        # URL-based platforms (see URL_BASED_PLATFORMS): the saved Careers
+        # URL is the whole input, and there is no guessed fallback.
+        if scraper and matched_name in URL_BASED_PLATFORMS:
+            if not row.get("careers_url"):
+                print(f"[scrape] {row['company']}: no Careers URL — a {matched_name} "
+                      f"board can't be guessed, needs manual lookup")
+                record(row, SCRAPE_NO_URL,
+                       f"{matched_name}: no Careers URL saved, and a {matched_name} board "
+                       f"can't be guessed from the company name.")
+                continue
+            try:
+                jobs = scraper(row["company"], row["careers_url"])
+                jobs = prepare_jobs(row, jobs)
+                all_jobs.extend(jobs)
+                scraped_ok.add(row["company"])
+                print(f"[scrape] {row['company']} (via {matched_name}): {len(jobs)} jobs")
+                record(row, SCRAPE_OK, f"{matched_name}: {len(jobs)} job(s)")
+            except Exception as error:
+                print(f"[scrape] {row['company']}: FAILED ({error})")
+                record(row, SCRAPE_FAILED, f"{matched_name}: {error}")
             continue
 
         if scraper:
@@ -676,16 +772,23 @@ def run_scrapers(companies):
                 # answer rather than guessing when a page names several
                 # boards, which is what keeps an aggregator's portfolio
                 # listings from being attached to this company.
-                found_platform, found_slug, how, _ = detect_embedded_board(
-                    row.get("careers_url"), SLUG_URL_PATTERNS)
+                print(f"[detect] {row['company']}")
+                try:
+                    found_platform, found_slug, how, _ = detect_embedded_board(
+                        row.get("careers_url"), SLUG_URL_PATTERNS)
+                except Exception as e:
+                    # One bad site must not abort the loop (invariant 25).
+                    print(f"[scrape] {row['company']}: board detection FAILED ({e})")
+                    record(row, SCRAPE_FAILED,
+                           f"Looking for the board on {row['careers_url']} failed: {e}")
+                    continue
                 if found_slug and found_platform == matched_name:
                     slug, slug_source = found_slug, f"the careers page — {how}"
                     print(f"[scrape] {row['company']}: found {matched_name} slug "
                           f"'{slug}' because {how}")
             try:
                 jobs = scraper(row["company"], slug=slug) if slug else scraper(row["company"])
-                for job in jobs:
-                    job["company_description"] = row.get("sector")
+                jobs = prepare_jobs(row, jobs)
                 all_jobs.extend(jobs)
                 scraped_ok.add(row["company"])
                 slug_note = f", slug from {slug_source}" if slug else ""
@@ -699,8 +802,7 @@ def run_scrapers(companies):
                 if slug:
                     try:
                         jobs = scraper(row["company"])  # no slug = falls back to guessing
-                        for job in jobs:
-                            job["company_description"] = row.get("sector")
+                        jobs = prepare_jobs(row, jobs)
                         all_jobs.extend(jobs)
                         scraped_ok.add(row["company"])
                         print(f"[scrape] {row['company']} (via {matched_name}, "
@@ -746,15 +848,22 @@ def run_scrapers(companies):
             # a researched fact a human may have set, and invariant 3
             # forbids the backfill overwriting one — so the Scrape Note
             # says what was found and leaves the field alone.
-            found_platform, found_slug, how, page_html = detect_embedded_board(
-                row.get("careers_url"), SLUG_URL_PATTERNS)
+            print(f"[detect] {row['company']}")
+            try:
+                found_platform, found_slug, how, page_html = detect_embedded_board(
+                    row.get("careers_url"), SLUG_URL_PATTERNS)
+            except Exception as e:
+                # One bad site must not abort the loop (invariant 25).
+                print(f"[scrape] {row['company']} (HTML): board detection FAILED ({e})")
+                record(row, SCRAPE_FAILED,
+                       f"Looking for the board on {row['careers_url']} failed: {e}")
+                continue
             embedded_scraper = SCRAPERS.get(found_platform) if found_slug else None
 
             if embedded_scraper:
                 try:
                     jobs = embedded_scraper(row["company"], slug=found_slug)
-                    for job in jobs:
-                        job["company_description"] = row.get("sector")
+                    jobs = prepare_jobs(row, jobs)
                     all_jobs.extend(jobs)
                     scraped_ok.add(row["company"])
                     print(f"[scrape] {row['company']} (via {found_platform}, "
@@ -777,8 +886,7 @@ def run_scrapers(companies):
             try:
                 jobs = html_generic.fetch_jobs(row["company"], row["careers_url"],
                                                html=page_html)
-                for job in jobs:
-                    job["company_description"] = row.get("sector")
+                jobs = prepare_jobs(row, jobs)
                 all_jobs.extend(jobs)
                 scraped_ok.add(row["company"])
                 print(f"[scrape] {row['company']} (via HTML): {len(jobs)} jobs")
@@ -848,7 +956,7 @@ def main():
         jobs = dedupe_jobs_by_url(jobs)
     print(f"{len(jobs)} posting(s) with a distinct URL go forward to scoring and Notion")
 
-    print("\n=== Step 5b: stamping scrape status onto the Target List ===")
+    print("\n=== Step 5b: stamping scrape status onto Companies ===")
     needs_check = [s for s in statuses if s["status"] != SCRAPE_OK]
     with timed("5  sync_scrape_status"):
         status_result = sync_scrape_status(statuses, dry_run=dry_run)
@@ -856,7 +964,7 @@ def main():
     print(f"{status_result['written']} row(s) restamped, "
           f"{status_result['unchanged']} already correct{tail}")
     print(f"{len(needs_check)} company(ies) need a manual look — they are the "
-          f"\"Needs Manual Check\" view on the Target List in Notion:")
+          f"\"Needs Manual Check\" view on Companies in Notion:")
     for entry in needs_check[:15]:
         print(f"       - {entry['row']['company']} [{entry['status']}]: {entry['note']}")
     if len(needs_check) > 15:
@@ -874,9 +982,20 @@ def main():
     print(f"Scored {len(jobs)} jobs")
 
     print("\n=== Step 8: syncing jobs to Notion ===")
+    # One-off hand-off from an interrupted run: output/carry_new_this_run.json
+    # lists page ids that run created. Deleted only after a real sync, so a
+    # second interruption leaves it in place for the next attempt.
+    carry_path = os.path.join("output", "carry_new_this_run.json")
+    carry_new_ids = []
+    if os.path.exists(carry_path):
+        with open(carry_path, encoding="utf-8") as f:
+            carry_new_ids = json.load(f)
     with timed("8  sync_jobs_to_notion"):
         sync_result = sync_jobs_to_notion(jobs, scraped_ok, dry_run=dry_run,
-                                          rubric_fingerprint=RUBRIC_FINGERPRINT)
+                                          rubric_fingerprint=RUBRIC_FINGERPRINT,
+                                          carry_new_ids=carry_new_ids)
+    if carry_new_ids and not dry_run:
+        os.remove(carry_path)
     print(f"{'[dry-run] would sync' if dry_run else 'Notion'}: "
           f"{sync_result['created']} created, {sync_result['updated']} updated, "
           f"{sync_result['unchanged']} unchanged (not written), "

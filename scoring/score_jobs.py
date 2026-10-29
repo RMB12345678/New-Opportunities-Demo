@@ -103,20 +103,26 @@ def _job_key(job):
 
 
 def _prompt_fingerprint():
-    """A cache entry is only a real answer to "how does this job score
-    under the CURRENT rubric" if nothing that could change the score has
-    moved since it was written — the rubric text, the model, the excluded-
-    keyword list, or the prompt/listing shape itself (SCORER_VERSION).
-    Entries keyed on job URL alone silently kept serving pre-change scores
-    forever; this fingerprint is compared against each entry's "rubric_fp"
-    in score_all() so a change forces a re-score instead."""
-    payload = (RUBRIC_TEXT + MODEL
+    """What decides whether a cached score is still served: the model, the
+    excluded-keyword list, and the prompt/listing shape (SCORER_VERSION).
+    Compared against each entry's "rubric_fp" in score_all().
+
+    The rubric text is deliberately NOT in here. A rubric edit applies to
+    postings scored from now on and leaves existing scores alone, because
+    re-scoring ~6,000 jobs to re-confirm mostly the same answers is money
+    spent for little. The cost of that choice: old and new scores come from
+    different rubrics until you force a re-score by bumping SCORER_VERSION.
+    Every entry records RUBRIC_HASH ("rubric_hash") so the cache still says
+    which rubric produced each score."""
+    payload = (MODEL
                + json.dumps(EXCLUDED_TITLE_KEYWORDS, sort_keys=True)
                + SCORER_VERSION)
     return hashlib.sha256(payload.encode()).hexdigest()[:12]
 
 
 RUBRIC_FINGERPRINT = _prompt_fingerprint()
+# Provenance only; never compared. See _prompt_fingerprint().
+RUBRIC_HASH = hashlib.sha256(RUBRIC_TEXT.encode()).hexdigest()[:12]
 
 
 def _write_cache_entry(cache, key, result):
@@ -127,6 +133,7 @@ def _write_cache_entry(cache, key, result):
     discarding it — old score next to new is the raw material for a future
     outcome-feedback loop, and it costs nothing to keep."""
     result["rubric_fp"] = RUBRIC_FINGERPRINT
+    result["rubric_hash"] = RUBRIC_HASH
     old = cache.get(key)
     if old is not None and old.get("score") is not None and old.get("rubric_fp") != RUBRIC_FINGERPRINT:
         result["previous"] = {k: v for k, v in old.items() if k != "previous"}
@@ -152,11 +159,29 @@ def _clean_description(raw):
     return text[:2500] if text else None
 
 
+# Context for the scorer about a company's size class, in the per-job user
+# message only — the system prompt (and so the rubric fingerprint) is
+# untouched. The line is omitted entirely for untiered jobs, which keeps
+# their message byte-identical and their cached scores valid. The cache key
+# is the job URL (_job_key), which this does not touch. If this wording
+# changes, already-cached Large MedTech scores were produced under the old
+# wording: bump SCORER_VERSION.
+_TIER_DESCRIPTIONS = {"Large MedTech": "Large MedTech (>$1B revenue)"}
+
+
+def _tier_line(job):
+    tier = job.get("company_tier")
+    if not tier:
+        return ""
+    return f"Company tier: {_TIER_DESCRIPTIONS.get(tier, tier)}\n"
+
+
 def _score_batch(batch):
     """Score up to BATCH_SIZE jobs in a single API call."""
     listing = "\n\n".join(
         f"[{i}]\nCompany: {j.get('company')}\n"
         f"Company description: {j.get('company_description') or 'unknown'}\n"
+        f"{_tier_line(j)}"
         f"Job title: {j.get('title')}\n"
         f"Location: {j.get('location') or 'unknown'}\n"
         f"--- Posting text ---\n{_clean_description(j.get('description')) or 'not available'}\n--- end posting ---"

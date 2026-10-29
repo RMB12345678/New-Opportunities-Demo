@@ -1,4 +1,5 @@
-"""Tests for the Scrape Status stamp written back to the Target List.
+"""Tests for the Scrape Status stamp written back to Companies (renamed from
+"Target List" on 2026-09-10 — same database, only the Notion display name changed).
 
 These back the "Needs Manual Check" view in Notion. That view is only as
 good as the stamp behind it, and the stamp has three properties worth
@@ -33,7 +34,7 @@ TODAY = __import__("datetime").date.today().isoformat()
 
 
 def company(name="Acme Medical", status=None, note=None, failing_since=None):
-    """A Target List row as get_all_companies() returns it. The three stamp
+    """A Companies row as get_all_companies() returns it. The three stamp
     fields default to None, which is what an unstamped row really looks
     like — every company was in that state before this feature landed."""
     return {"page_id": "pg-" + name.lower().replace(" ", "-"), "company": name,

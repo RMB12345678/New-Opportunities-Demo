@@ -66,6 +66,112 @@ def try_known_patterns(company_name):
     return None, None
 
 
+# --- sniffing a careers page for a branded-front-end ATS --------------------
+# Large companies often put their own branded page in front of a standard ATS,
+# so the research step reads "in-house" while the page source names the real
+# one. This is free (one GET, no API call) and runs before an in-house or
+# not-found answer is accepted.
+#
+# Each pattern captures enough to name a distinct board, because the rule is
+# the one find_embedded_board.py learned the hard way (invariant 19): a page
+# may name SEVERAL boards, and attaching the wrong one is worse than saying
+# nothing. So this answers only when the page names exactly one platform AND
+# one board of it. Taleo (taleo.net) is deliberately not detected — it is a
+# different product with a different API, and mislabeling it would route it
+# to a scraper that cannot read it.
+_SNIFF_UA = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    ),
+}
+
+# platform name as written to ATS Platform -> (scrape method, [(regex, board-url builder)])
+_SNIFF_PATTERNS = [
+    ("Workday", "API",
+     re.compile(r"https?://([a-z0-9\-]+\.wd\d+)\.myworkdayjobs\.com"
+                r"(?:/[a-z]{2}-[A-Z]{2})?/([A-Za-z0-9_\-]+)", re.I),
+     lambda m: f"https://{m.group(1)}.myworkdayjobs.com/{m.group(2)}"),
+    ("Oracle Recruiting Cloud", "API",
+     re.compile(r"https?://([a-z0-9.\-]+\.oraclecloud\.com)/hcmUI/CandidateExperience/"
+                r"[A-Za-z\-]+/sites/([A-Za-z0-9_\-]+)", re.I),
+     lambda m: f"https://{m.group(1)}/hcmUI/CandidateExperience/en/sites/{m.group(2)}"),
+    ("iCIMS", "HTML",
+     re.compile(r"https?://((?!static\.|www\.|content\.|assets\.|cdn\.|img\.|images\.|"
+                r"login\.|app\.|api\.|support\.)[a-z0-9\-]+\.icims\.com)", re.I),
+     lambda m: f"https://{m.group(1)}"),
+    # career5.successfactors.com/career?company=X is the JS-rendered shape;
+    # rmkcdn.successfactors.com is the CDN of the branded "RMK" career-site
+    # template, which is how a custom-domain SuccessFactors site gives itself away.
+    ("SuccessFactors", "HTML",
+     re.compile(r"https?://((?:career\d*|rmkcdn|jobs|performancemanager\d*)"
+                r"\.(?:successfactors\.(?:com|eu)|sapsf\.(?:com|eu))"
+                r"(?:/career\?[^\s\"'<>\]*company=[A-Za-z0-9_\-]+)?)", re.I),
+     lambda m: m.group(0)),
+]
+
+_UNRESOLVED_ATS = re.compile(
+    r"\b(none|in-?house|not found|custom|proprietary|manual)\b", re.IGNORECASE)
+
+
+def ats_is_unresolved(ats_text):
+    """True when the research answer amounts to 'no standard ATS' — the
+    answers worth double-checking against the page source."""
+    return bool(ats_text) and bool(_UNRESOLVED_ATS.search(ats_text))
+
+
+def sniff_ats_from_page(careers_url, html=None):
+    """Look in a careers page's source (and where it redirects to) for a
+    Workday, Oracle Recruiting Cloud, iCIMS or SuccessFactors board.
+
+    Returns {"platform", "method", "board_url", "evidence"} or None. None
+    covers every non-answer — nothing found, the page named several
+    boards or platforms, or the fetch failed. A failed fetch is not
+    "in-house" (invariant 1), but it is also not an answer this function
+    can give, so the caller keeps the research result unchanged.
+    Pass html to reuse a page that is already in hand.
+    """
+    if not careers_url:
+        return None
+    corpus = []
+    if html is None:
+        try:
+            resp = _guess_session.get(careers_url, headers=_SNIFF_UA, timeout=15)
+        except requests.RequestException:
+            return None
+        if resp.status_code != 200:
+            return None
+        corpus.extend(r.headers.get("Location", "") for r in resp.history)
+        corpus.append(resp.url)
+        html = resp.text
+    # JSON-embedded URLs arrive as https:\/\/host\/path or with \u002F for
+    # the slashes — undo both so the patterns below see ordinary URLs.
+    corpus.append(re.sub(r"\\/|\\u002f", "/", html, flags=re.I))
+    text = "\n".join(corpus)
+
+    boards = {}
+    for platform, method, rx, build in _SNIFF_PATTERNS:
+        # Keyed lowercase so case-only repeats count once, but the original
+        # spelling is kept: a Workday site or an Oracle siteNumber
+        # (CX_1001) is case-sensitive in the API path.
+        found = {}
+        for m in rx.finditer(text):
+            found.setdefault(build(m).lower(), build(m))
+        if found:
+            boards[platform] = (method, found)
+    if len(boards) != 1:
+        return None
+    platform, (method, found) = next(iter(boards.items()))
+    if len(found) != 1:
+        return None
+    board = next(iter(found.values()))
+    return {
+        "platform": platform, "method": method,
+        "board_url": board if platform != "SuccessFactors" or "company=" in board else careers_url,
+        "evidence": f"{platform} reference found in the page source: {board}",
+    }
+
+
 def find_via_search(company_name, hq=None, known_platform=None):
     """Fallback: ask Claude (with web search) to fully profile a new
     company — sector/description, HQ, ATS platform, and careers URL — in
@@ -106,6 +212,12 @@ def find_via_search(company_name, hq=None, known_platform=None):
         "Greenhouse": "boards.greenhouse.io or job-boards.greenhouse.io",
         "Lever": "jobs.lever.co",
         "Ashby": "jobs.ashbyhq.com",
+        "Workday": "myworkdayjobs.com (a board like https://tenant.wd5.myworkdayjobs.com/SiteName)",
+        "Oracle Recruiting Cloud": "oraclecloud.com (a board like https://x.fa.us2.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1)",
+        "SuccessFactors": "successfactors.com or sapsf.com, or the company's own branded career-site domain",
+        "iCIMS": "icims.com (a portal like https://careers-company.icims.com)",
+        "Avature": "avature.net, or the company's own /careers/ domain built on Avature",
+        "Taleo": "taleo.net (a section like https://company.taleo.net/careersection/)",
     }
     if known_platform and known_platform in platform_domains:
         url_instruction = f"""This company's ATS is ALREADY CONFIRMED as {known_platform}. Do not
@@ -236,7 +348,10 @@ HOMEPAGE: <the company's main website URL (e.g. "https://example.com"), or "N/A"
         if not all_urls:
             return raw
 
-        known_ats_domains = ("greenhouse.io", "lever.co", "ashbyhq.com")
+        known_ats_domains = ("greenhouse.io", "lever.co", "ashbyhq.com",
+                             "myworkdayjobs.com", "oraclecloud.com", "icims.com",
+                             "successfactors.com", "sapsf.com", "avature.net",
+                             "taleo.net")
         for candidate in all_urls:
             if any(domain in candidate for domain in known_ats_domains):
                 return candidate.rstrip(").,;\"'")
@@ -301,6 +416,19 @@ def find_company_info(company_name, hq=None, known_platform=None):
     instead of risking a generic homepage that can't be scraped).
     """
     info = find_via_search(company_name, hq, known_platform=known_platform)
+
+    # An in-house / not-found answer is the one most worth double-checking:
+    # a branded front end over Workday, Oracle, SuccessFactors or iCIMS reads
+    # as in-house to a search and only shows in the page source.
+    if (not info["ambiguous"] and info.get("careers_url")
+            and ats_is_unresolved(info["ats_platform"])):
+        sniffed = sniff_ats_from_page(info["careers_url"])
+        if sniffed:
+            info["ats_platform"] = sniffed["platform"]
+            info["scrape_method"] = sniffed["method"]
+            info["careers_url"] = sniffed["board_url"]
+            info["sniffed_from_page"] = sniffed["evidence"]
+            return info
 
     if not info["ambiguous"]:
         platform, method = try_known_patterns(company_name)

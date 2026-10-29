@@ -1,12 +1,12 @@
 # Job Agent Punch List
 
-23 improvements, ordered by how much each changes the quality of what lands in the
+27 improvements, ordered by how much each changes the quality of what lands in the
 Notion dashboard. Verified against commit `243b2f2` on 2026-08-22. #18 and #19 were
 found 2026-08-23 during a live `--dry-run`, #20 on 2026-09-09 while measuring a
 real run, and #23 on 2026-09-29 by auditing the Job Postings database itself, all
 added after the original 17.
 
-**As of 2026-09-29: 10 done, 1 resolved as intentional, 4 partial, 8 open.**
+**As of 2026-10-02: 10 done, 1 resolved as intentional, 4 partial, 12 open.** #24-#27 are Large MedTech follow-ups.
 Each item carries its own status line with what actually landed.
 
 Severity is damage to the output. Effort is a rough estimate for a Claude-assisted
@@ -38,6 +38,11 @@ priority order, because several items depend on another landing first.
 | 21 | Named ATS platforms with no scraper | High | 3-4 h | Done |
 | 22 | A wrong saved value is indistinguishable from a researched one | High | 1-2 h | Partial |
 | 23 | Duplicate rows stay New This Run forever | High | 1 h | Done |
+| 24 | Large MedTech companies no scraper reaches | High | 3-4 h | Open |
+| 25 | JS-rendered SuccessFactors sites need a browser | Medium | 3 h | Open |
+| 26 | SENIOR_TITLE_RE lets noise through | Low | 20 m | Open |
+| 27 | resolve_scraper reads platform names out of negative text | Medium | 30 m | Open |
+| 28 | Scrapers can still sleep on a server's Retry-After | High | 1 h | Open |
 
 ---
 
@@ -749,7 +754,7 @@ invariants rather than comments because the next scraper will meet them again:
 Teamtailor's slug is a whole hostname (its customers run on their own domains),
 and Personio answers a missing tenant with a 307 to its own marketing site
 rather than a 404 — which the shared retry session then retried five times with
-backoff against a site that never had the answer. See invariant 19.
+backoff against a site that never had the answer. See invariant 17.
 
 **Left open**
 - **BambooHR and Recruitee** (Proscia, Ibex) both look to have usable public
@@ -788,7 +793,7 @@ listed `notion.so` and `notion.site` but not `notion.com`.
 Both selectors now test the value rather than its presence. The bar is
 structural impossibility, not suspicion, because acting on a rejection means
 overwriting: the deliberate Google-search fallback and a merely stale URL both
-still pass. See invariant 20 for the two constraints that must hold if the host
+still pass. See invariant 18 for the two constraints that must hold if the host
 lists are ever widened.
 
 The audit also surfaced a second bad-value shape the fix now catches: **88 rows**
@@ -875,6 +880,87 @@ Tests: `tests/test_duplicate_postings.py`, plus the Workable collapse cases in
 2. **A page that links several roles to one URL still loses roles** — Peritas AI
    (4) and Insmed (1) on the last run. That is punch list #5, and the answer is a
    per-role URL from the HTML scraper, not a dedupe.
+
+## 24. Large MedTech companies no scraper reaches
+**High** · `ats_finder/`, `scrapers/`
+
+**Status: open, 2026-10-02.** The tier's dry runs left these in Needs Manual Check or
+unresearched:
+
+- **Masimo** — labelled Workday, but its postings sit on Danaher's shared board
+  (`danaher.wd1…/DanaherJobs`). Needs the facet id that filters to Masimo; do not
+  guess it (a mixed list attributed to one company is the failure `_verify_facets`
+  exists to prevent).
+- **Align Technology** — labelled Workday, but no Workday board exists. It uses
+  iCIMS' Jibe front end (`aligntech.jibeapply.com`), which is not an `icims.com`
+  portal and has a different API. The one company that would justify an iCIMS/Jibe
+  scraper.
+- **B. Braun** — RMK site whose result list is JavaScript-filled (item #25).
+  **Steris, Straumann** — labelled SuccessFactors but not RMK sites; the real ATS is
+  unidentified (Steris's `/us/en` and Straumann's `/global/en` pages look like a
+  different product).
+- **Siemens Healthineers, GE HealthCare, Enovis** — "in-house"; the page-source sniff
+  found no embedded board. **Philips** (Phenom People), **Fisher & Paykel** (SnapHire)
+  — no scraper for either platform.
+- **Johnson & Johnson MedTech** — research reply hit the token cap; blank ATS, retries
+  on the next real run. **Envista** — ambiguous between three companies; rename it
+  (e.g. "Envista Holdings (dental)") and clear ATS Platform to re-research.
+- **Convatec** — Workday scrape OK but zero senior roles of 113 postings; plausibly
+  true, worth one look. **BD** — saved board is `EXTERNAL_CAREER_SITE_USA` only, so
+  non-US senior roles are missed.
+
+## 25. JS-rendered SuccessFactors sites need a browser
+**Medium** · `scrapers/successfactors.py`
+
+**Status: open, 2026-10-02.** `career{N}.successfactors.com/career?company=…` pages and
+RMK sites like B. Braun fill their job list with JavaScript, so plain `requests` sees a
+shell. The scraper raises "needs a browser" rather than returning zero jobs
+(invariant 23), which is correct but leaves those companies uncovered. A browser path
+needs a new dependency (Playwright), which CLAUDE.md says to ask about first. Check
+first whether the page calls a JSON endpoint that can be read directly — that would
+avoid the browser entirely.
+
+## 26. SENIOR_TITLE_RE lets noise through
+**Low** · `run.py`
+
+**Status: open, 2026-10-02.** "Associate Director" and "Director" in a title like
+"Executive Assistant, VP Commercial" both pass. Watch the first real run's Large
+MedTech rows in New This Run; if the noise is high, options are excluding
+`associate director` / `assistant to` / `executive assistant`, or dropping `head of`
+/ `chief` / `general manager` (the brief expected to trim these). Any edit changes
+which rows exist, not scores, so it does not touch the fingerprint — but a narrower
+regex will make the close pass retire rows that were already synced.
+
+## 27. resolve_scraper reads platform names out of negative text
+**Medium** · `run.py`
+
+**Status: open, 2026-10-02.** Siemens Healthineers' ATS Platform is a long "in-house …
+not a standard ATS like Greenhouse/Lever/Workday" sentence. `resolve_scraper()` matches
+platform names anywhere in the text, so it matches three of them, warns, and uses
+Greenhouse — a guessed-slug scrape of a company that has no Greenhouse board. It fails
+safely today (the guess 404s) but a guessed slug can land on someone else's board. Fix:
+skip names that follow "not"/"like"/"such as", or give in-house answers a fixed short
+marker.
+
+## 28. Scrapers can still sleep on a server's Retry-After
+**High** · `http_client.py`, `scrapers/`
+
+**Status: open, 2026-10-26.** The 2026-10-26 hang (changelog; invariant 25) was
+fixed in `detect_embedded_board()` and `html_generic` (both now on
+`http_client.third_party_session`; Sonivie's `Retry-After: 600` showed the second one
+was needed). Every other scraper still calls the shared
+`session` from `http_client.py`, which has `respect_retry_after_header=True`, so a
+site answering 429/503 with a huge `Retry-After` can freeze a run the same way, with
+its `timeout=` set correctly and doing nothing. Audit `greenhouse`, `lever` and
+`ashby` first, then the rest. They talk to vendor APIs rather than arbitrary
+sites, so the risk is lower than html_generic's was. Two gaps to check in each:
+(1) is the call on a session with `respect_retry_after_header=False`; (2) does it pass
+`timeout=`. All of them pass a timeout today (10–30 s) — gap 2 is a check, gap 1 is
+the real work. Simplest fix is to flip the flag in `http_client.py` (a bounded
+`backoff_factor` is enough for Notion and Anthropic too) or cap the sleep with a
+`Retry.DEFAULT_BACKOFF_MAX`-style limit; either changes retry behaviour for Notion
+and the scorer, so do it deliberately. Also confirm the `try` around each scraper call
+in `run_scrapers` covers everything that can raise.
 
 ## Suggested batching
 

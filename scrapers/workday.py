@@ -22,6 +22,7 @@ import re
 from urllib.parse import urlparse, parse_qs
 
 from http_client import session
+from scrapers.common import ScrapeShapeError, dedupe_by_url, polite_sleep
 
 # Workday rejects the bare programmatic request on some tenants, so send
 # what a browser sends. This is not evasion of a bot check — the boards are
@@ -120,8 +121,43 @@ def _post(api_url, payload):
     return resp.json()
 
 
+def _expect_shape(company_name, data):
+    """A board answers with {"total": n, "jobPostings": [...]}. Anything
+    else — an HTML login wall, a maintenance page that still says 200, a
+    changed API — is "couldn't parse", not "zero jobs": raising lands the
+    company in Scrape Status with a reason, where returning [] would score
+    it as an empty board and close its rows."""
+    if not isinstance(data, dict) or ("jobPostings" not in data and "total" not in data):
+        raise ScrapeShapeError(
+            f"{company_name}: Workday answered 200 but not with a job list "
+            f"(got {type(data).__name__}{': ' + str(sorted(data))[:80] if isinstance(data, dict) else ''}) "
+            f"— refusing to read that as an empty board")
+    return data
+
+
+def _collect_term(company_name, api_url, applied_facets, term):
+    """Every posting matching one search term, paged to exhaustion."""
+    postings, offset, total = [], 0, None
+    for _ in range(MAX_PAGES):
+        data = _expect_shape(company_name, _post(api_url, {
+            "appliedFacets": applied_facets,
+            "limit": PAGE_SIZE,
+            "offset": offset,
+            "searchText": term,
+        }))
+        if total is None:
+            total = data.get("total") or 0
+        batch = data.get("jobPostings") or []
+        postings.extend(batch)
+        offset += PAGE_SIZE
+        if not batch or offset >= total:
+            break
+        polite_sleep()
+    return postings
+
+
 def fetch_jobs(company_name, host=None, wd=None, tenant=None, site=None,
-               applied_facets=None):
+               applied_facets=None, search_terms=None):
     """Fetch every posting on a Workday board, paging until the board is
     exhausted.
 
@@ -143,6 +179,12 @@ def fetch_jobs(company_name, host=None, wd=None, tenant=None, site=None,
     quietly returning the whole unfiltered tenant — a mixed job list
     attributed to one subsidiary is worse than an honest failure, because
     nothing downstream would ever catch it.
+
+    search_terms: when given, run one narrow query per term instead of
+    paging the whole board, and dedupe by URL. Used for the Large MedTech
+    tier, where only senior titles are kept and a board like Abbott's runs
+    to ~2,000 postings. None (the default) keeps the full-board behaviour
+    every other company relies on.
     """
     if not (host and wd and site):
         raise ValueError(
@@ -154,43 +196,49 @@ def fetch_jobs(company_name, host=None, wd=None, tenant=None, site=None,
     applied_facets = applied_facets or {}
     api_url = f"https://{host}.{wd}.myworkdayjobs.com/wday/cxs/{tenant}/{site}/jobs"
 
-    first = _post(api_url, {
+    first = _expect_shape(company_name, _post(api_url, {
         "appliedFacets": {},
         "limit": PAGE_SIZE,
         "offset": 0,
         "searchText": "",
-    })
+    }))
 
     if applied_facets:
         _verify_facets(company_name, first, applied_facets)
-        first = _post(api_url, {
+        first = _expect_shape(company_name, _post(api_url, {
             "appliedFacets": applied_facets,
             "limit": PAGE_SIZE,
             "offset": 0,
             "searchText": "",
-        })
+        }))
 
-    total = first.get("total") or 0
-    postings = list(first.get("jobPostings") or [])
+    if search_terms:
+        postings = []
+        for term in search_terms:
+            postings.extend(_collect_term(company_name, api_url, applied_facets, term))
+            polite_sleep()
+    else:
+        total = first.get("total") or 0
+        postings = list(first.get("jobPostings") or [])
 
-    # Page until we have everything `total` promised. The empty-page check
-    # is the real terminator: `total` is trustworthy in practice but a
-    # board that shrinks mid-scrape would otherwise spin.
-    for page in range(1, MAX_PAGES):
-        if len(postings) >= total:
-            break
-        batch = _post(api_url, {
-            "appliedFacets": applied_facets,
-            "limit": PAGE_SIZE,
-            "offset": page * PAGE_SIZE,
-            "searchText": "",
-        }).get("jobPostings") or []
-        if not batch:
-            break
-        postings.extend(batch)
+        # Page until we have everything `total` promised. The empty-page check
+        # is the real terminator: `total` is trustworthy in practice but a
+        # board that shrinks mid-scrape would otherwise spin.
+        for page in range(1, MAX_PAGES):
+            if len(postings) >= total:
+                break
+            batch = _expect_shape(company_name, _post(api_url, {
+                "appliedFacets": applied_facets,
+                "limit": PAGE_SIZE,
+                "offset": page * PAGE_SIZE,
+                "searchText": "",
+            })).get("jobPostings") or []
+            if not batch:
+                break
+            postings.extend(batch)
 
     base = f"https://{host}.{wd}.myworkdayjobs.com/en-US/{site}"
-    return [
+    jobs = [
         {
             "company": company_name,
             "title": job.get("title"),
@@ -212,6 +260,7 @@ def fetch_jobs(company_name, host=None, wd=None, tenant=None, site=None,
         }
         for job in postings
     ]
+    return dedupe_by_url(jobs) if search_terms else jobs
 
 
 def _verify_facets(company_name, response, applied_facets):

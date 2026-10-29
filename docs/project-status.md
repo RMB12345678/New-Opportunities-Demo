@@ -1,14 +1,14 @@
 # Project status
 
 *Originally written Aug 17–18, 2026. Ported into the repo Aug 22, 2026. Last updated
-Sep 9, 2026.*
+Oct 2, 2026.*
 
 Background and history for anyone (including Claude) picking this up cold. For the
 active work list see `docs/punch-list.md`. For working rules see `CLAUDE.md`.
 
 ## What this project is
 
-An automated pipeline that tracks job postings across ~425 target companies (medtech,
+An automated pipeline that tracks job postings across ~1,500 target companies (medtech,
 digital health, healthcare-focused PE/VC), scores them against a custom fit rubric,
 and syncs results into a live Notion dashboard. The repo owner holds the architecture decisions
 and business logic (the rubric); Claude wrote the implementation.
@@ -19,10 +19,10 @@ and business logic (the rubric); Claude wrote the implementation.
   mirror. Runs locally via `python run.py`. Not yet on a schedule.
 - **Company data** — Notion "Companies" database (renamed from "Target List" on
   2026-09-10; same id, same data source, display name only), `<redacted>`
-  (data source `<redacted>`). ~425 companies.
+  (data source `<redacted>`). 1,502 rows as of 2026-10-29.
 - **Job data** — Notion "Job Postings" database, `<redacted>`
   (data source `<redacted>`). Related to Companies via a
-  "Company" relation. ~3,200 rows as of the Sep 9 run.
+  "Company" relation. 11,057 rows (8,368 open) as of 2026-10-29.
 - **Dashboard** — Notion "Active Opportunities" page, `<redacted>`.
   Active Roles, To Do, Job Boards (ExecuNet, Reccy, Kidneyverse/Signals), and link
   cards to both databases.
@@ -145,16 +145,10 @@ Listed for pattern-matching if similar symptoms reappear.
 - **Genuinely ambiguous company names** — Signals Group, BioHope Scientific, Montagu,
   Ortivity. No confirmed ATS or careers page, all still No Scraper. Not necessarily
   wrong, just unresolved.
-- **No outcome feedback loop.** Application Status, Date Applied and Application Notes
-  exist on Job Postings, and as of Sep 11 the sync stamps `Date Applied` automatically
-  once a row is hand-marked Applied — but nothing yet uses that data to recalibrate the
-  rubric. This is the planned "closed loop" phase, and it is explicitly human-reviewed
-  recalibration rather than automated retraining, given realistic data volume.
-- **Application tracking is half-manual by budget, not by design.** Setting
-  `Application Status` when a posting changes hands is a human step, and stamping the
-  date the moment it changes would be a Notion database automation, which needs a paid
-  plan. `_backfill_applied_dates()` closes the second half of that gap on the next run
-  instead of instantly; the first half stays manual.
+- **No outcome feedback loop.** Date Applied and Application Notes exist on Job
+  Postings, but nothing uses that data to recalibrate the rubric. This is the planned
+  "closed loop" phase, and it is explicitly human-reviewed recalibration rather than
+  automated retraining, given realistic data volume.
 
 ## Roadmap
 
@@ -166,6 +160,48 @@ Listed for pattern-matching if similar symptoms reappear.
 
 ## Changelog
 
+- **Oct 26, 2026** — Fixed a ~3-hour hang in the scrape step. A run froze after
+  Carolina Instruments; Ctrl+C showed it asleep in urllib3
+  `Retry.sleep_for_retry` -> `time.sleep(retry_after)`, called from
+  `detect_embedded_board()` for the next HTML-marked company. That site answered
+  429/503 with a very large `Retry-After`, the shared session in `http_client.py`
+  honoured it, and the request `timeout` does not cover a retry sleep. Fix:
+  `find_embedded_board.py` now has its own session (total=2, backoff_factor=1,
+  `respect_retry_after_header=False`); both `detect_embedded_board` call sites in
+  `run_scrapers()` are wrapped in `try/except Exception` and a failure is recorded
+  as `Failed` with a Scrape Note, so one bad site no longer aborts the loop; a
+  `[detect] <company>` line prints before each call; and every call in
+  `notion/client.py` now passes `timeout=30` (there was none). New invariant 25.
+  The fix first landed in `find_embedded_board.py` only; the next real run then stalled
+  9+ minutes on Sonivie (503 with `Retry-After: 600`), this time in
+  `html_generic.fetch_jobs`, which fetches the same page through the shared session.
+  The no-`Retry-After` session therefore moved to `http_client.third_party_session`
+  and both modules use it. The patient session and the API scrapers on it are
+  unchanged — punch list #28.
+
+- **Oct 2, 2026** — Added a **Large MedTech** tier: 37 companies over $1B revenue
+  that are scraped in full but only kept, scored and synced when the title is senior
+  (VP / SVP / Director / Head of / General Manager / Chief). Six commits:
+  (1) `Company Tier` read into `row["tier"]`; `prepare_jobs()` filters in every
+  `run_scrapers` branch before `all_jobs.extend`; the scorer's per-job message gains
+  a tier line while the system prompt and cache key stay put. (2) **Rubric change:**
+  removed the deal-breaker "Public company role requiring investor relations or
+  public-market experience". By invariant 10 this invalidates the score cache; the
+  next real run re-scores every job (6,232 cache entries) unless
+  `restamp_score_cache.py --apply` is run first (it would keep 5,924 and leave the 306
+  that cite the rule). Not yet run. (3) 30 companies added to Companies (7 of the 37
+  already existed and were tiered in place); `sniff_ats_from_page()` reads a careers
+  page's source for a hidden Workday / Oracle / iCIMS / SuccessFactors board before
+  an in-house answer is accepted. Five Workday Careers URLs (BD, Dexcom, Convatec,
+  Integer, Elekta) were replaced with their real boards. (4) `URL_BASED_PLATFORMS`,
+  `PLATFORM_ALIASES`, `scrapers/common.py`; the existing Workday scraper gained a
+  search-term mode and a shape check. (5) Oracle Recruiting Cloud scraper (Cooper,
+  ICU Medical). (6) SuccessFactors RMK scraper (Coloplast, Bausch + Lomb, Sonova,
+  Boston Scientific, Terumo, Teleflex). Dry-run results: Workday 15 of 18 companies OK
+  (Convatec 0 kept), Oracle 2 of 2, SuccessFactors 6 of 9. **Not built:** iCIMS (no
+  company on it), Avature and Taleo (Boston Scientific, Terumo and Teleflex had been
+  mislabelled from their `/go/` URL shape; they are SuccessFactors). The full pipeline
+  has not been run since.
 - **Sep 29, 2026** — Fixed duplicate Job Postings rows that stayed flagged
   `New This Run` indefinitely (#23). Found in the data, not the code: 194 rows
   were ticked and only 147 had been created that day. Root cause was Workable
@@ -184,13 +220,15 @@ Listed for pattern-matching if similar symptoms reappear.
   parsed, the cap went 500 → 1500, a reply carrying none of the expected fields
   raises, and `_extract()` anchors to line starts and takes the last match rather
   than the first (it was returning the model's own narration on replies that
-  narrated before answering). The 36 rows already carrying the marker were cleared
-  so they get re-researched. #19: confirmed the gap was real by sweeping all 198
-  HTML-marked companies with a Careers URL — **20** reach an ATS board nothing was
-  reading, worth **379 postings**, and 10 have a slug the name-guess gets wrong.
-  `ats_finder/find_embedded_board.py` detects them via redirect, embed or link, and
-  refuses rather than guessing when a page names several boards, which is what stops
-  an aggregator's portfolio listings being attached to it. New invariant 21.
+  narrated before answering). The recovery pass for the 36 existing markers is
+  written (`reset_failed_ats_research.py`) but deliberately not run: it costs ~36
+  research calls. #19: confirmed the gap was real by sweeping all 198
+  HTML-marked companies with a Careers URL — **20** reach an ATS board nothing
+  was reading, worth **379 postings**, and 10 have a slug the name-guess gets
+  wrong. `ats_finder/find_embedded_board.py` detects them via redirect, embed or
+  link, and refuses rather than guessing when a page names several boards, which
+  is what stops an aggregator's portfolio listings being attached to it (Atomic
+  VC's page yields Exowatt to a naive reading). New invariant 19.
 - **Sep 21, 2026** — Audited all 470 `ATS Platform` values against `resolve_scraper()`
   and added the seven scrapers the audit called for (#21): Workable, Personio, Breezy,
   Rippling, Teamtailor, SmartRecruiters, Pinpoint — 25 companies, **106 postings** that
@@ -200,19 +238,22 @@ Listed for pattern-matching if similar symptoms reappear.
   Notion document link in `Careers URL`, which — being non-blank — made them permanently
   invisible to the careers-URL backfill while the scrape failed on them every run, and
   which had already propagated into `Website` for 18 of them. Both selectors now test
-  the value, not just its presence; the 20 bad URLs were cleared with a one-off pass.
-  New invariants 19 and 20.
-- **Sep 11, 2026** — Job Postings rows now inherit their company's page icon, copied
-  from the Target List row during the sync and backfilled onto existing rows that have
-  none (invariant 17 in `CLAUDE.md`). Added `_backfill_applied_dates()`, which stamps
-  `Date Applied` on any row hand-marked `Application Status` = Applied with the date
-  still blank, over every row Notion holds rather than just this run's scrape
-  (invariant 18). Both honour `--dry-run`.
-- **Sep 10, 2026** — Added a `Website` property to the Target List plus a pipeline step,
+  the value, not just its presence. Cleared the 20 bad URLs in Notion via
+  `reset_placeholder_careers_urls.py`. New invariants 17 and 18.
+- **Sep 10, 2026** — Added a `Website` property to Companies plus a pipeline step,
   `fill_missing_website()`, that derives it (free extraction from the Careers URL first,
   an Anthropic homepage search only if that fails) and stamps the page icon with a real
   favicon logo or a plain white square either way — see `ats_finder/find_website.py`
-  and invariant 16 in `CLAUDE.md`.
+  and invariant 16 in `CLAUDE.md`. Roughly 200 of ~440 companies were backfilled by hand
+  first (real domain + favicon), to spot-check icon quality before trusting the
+  heuristic at scale; the rest — including the "checked, nothing found" white-square
+  stamp — are left for `fill_missing_website()` to finish on the next real run.
+- **Sep 10, 2026** — Notion content moved to a new dedicated workspace (Companies,
+  Job Postings, and the Active Opportunities dashboard duplicated across, relation to
+  Companies confirmed intact, originals then moved to Trash). New database ids; `.env`
+  updated with a new token. Separately, `scrapers/html_generic.py` and its tests picked
+  up a same-day fix for false-positive job postings — see git log for that commit's
+  message and detail.
 - **Sep 9, 2026** — Delta-only Job Postings sync (#20): the sync now reads back every
   property it owns and writes only the rows that moved, cutting a steady-state run
   from ~3,273 writes to ~100. Found and fixed the select-casing comparison bug in the
@@ -233,6 +274,6 @@ Listed for pattern-matching if similar symptoms reappear.
 - **Aug 22, 2026** — Full code review against commit `243b2f2`; produced
   `docs/punch-list.md` (17 items, since grown to 20). Added `CLAUDE.md`. Ported this
   doc into the repo.
-- **Aug 20, 2026** — Pushed to GitHub (initial commit).
+- **Aug 20, 2026** — Pushed to GitHub as `Job-Search-Agent` (initial commit).
 - **Aug 17–18, 2026** — Added Head of Product to the rubric. Added Date Applied,
   Application Notes, Application Summary to Job Postings. Fixed the bug list above.

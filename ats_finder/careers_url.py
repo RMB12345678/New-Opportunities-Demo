@@ -7,7 +7,7 @@ answers are still *answers*. It has no defence against a field holding
 something that was never an answer in the first place.
 
 That gap was found the hard way. Twenty rows carried the same
-`app.notion.com/p/...` link in `Careers URL`, pasted into the wrong
+`app.notion.com/p/PocDoc-...` link in `Careers URL`, pasted into the wrong
 column at some point. Because the field was non-blank,
 `get_companies_missing_url()` never revisited them, so the scrape retried
 them every run, guessed a slug from the company name, failed, and stamped
