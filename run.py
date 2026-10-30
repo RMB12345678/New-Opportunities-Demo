@@ -118,6 +118,9 @@ def print_api_report(dry_run=False):
 # "general manager" and "chief" are there for the rubric's target titles
 # (Head of Product, GM North America, CCO).
 LARGE_MEDTECH_TIER = "Large MedTech"
+LARGE_BIOTECH_TIER = "Large Biotech"
+# Every tier the senior filter and the senior search terms apply to.
+SENIOR_FILTER_TIERS = {LARGE_MEDTECH_TIER, LARGE_BIOTECH_TIER}
 SENIOR_TITLE_RE = re.compile(
     r"\b(vp|svp|vice president|director|head of|general manager|chief)\b",
     re.IGNORECASE,
@@ -147,7 +150,7 @@ def prepare_jobs(row, jobs):
         job["company_description"] = row.get("sector")
         if tier:
             job["company_tier"] = tier
-    if tier != LARGE_MEDTECH_TIER:
+    if tier not in SENIOR_FILTER_TIERS:
         return jobs
     kept = [j for j in jobs if SENIOR_TITLE_RE.search(j.get("title") or "")]
     print(f"[scrape] {row['company']}: kept {len(kept)} of {len(jobs)} (senior filter)")
@@ -724,7 +727,7 @@ def run_scrapers(companies):
                 # Large MedTech boards run to thousands of postings and only
                 # senior titles are kept, so ask for those instead of paging
                 # the whole board.
-                terms = SENIOR_SEARCH_TERMS if row.get("tier") == LARGE_MEDTECH_TIER else None
+                terms = SENIOR_SEARCH_TERMS if row.get("tier") in SENIOR_FILTER_TIERS else None
                 jobs = workday.fetch_jobs(row["company"], search_terms=terms, **params)
                 jobs = prepare_jobs(row, jobs)
                 all_jobs.extend(jobs)
