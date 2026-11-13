@@ -12,6 +12,7 @@ Requires env var NOTION_DATABASE_ID (the ID of the Companies database,
 found in its page URL).
 """
 import collections
+import datetime
 import os
 import time
 import requests
@@ -1036,6 +1037,133 @@ def _print_close_candidates(to_close, left_open_failed, left_open_unresolved):
         print(f"       {verdict} {company[:30]:<30} — {reason:<30} {title[:50]}")
 
 
+# Notion ends a single query's pagination at 10,000 rows: has_more comes back
+# false and the rest simply is not delivered, with no error and no warning.
+# Job Postings crossed that line (11,057 rows against 10,000 returned), and
+# everything the sync decides from "the rows Notion already holds" — create vs
+# update by URL, the close pass, the delta comparison, the New This Run reset —
+# quietly stopped seeing the overflow. So the read is sliced by created_time,
+# which every row has and which cannot be edited, and no slice is trusted if it
+# comes back at the cap. See invariant 26.
+JOB_QUERY_CAP = 10000
+
+
+def _utc(dt):
+    return dt.astimezone(datetime.timezone.utc)
+
+
+def _parse_notion_time(text):
+    return _utc(datetime.datetime.fromisoformat(text.replace("Z", "+00:00")))
+
+
+def _fetch_job_postings(flt, company_name_by_page_id, page_size=100):
+    """One paginated query, optionally filtered. Returns the rows as
+    _job_posting_row() builds them. Not safe to call unfiltered on a large
+    database: see JOB_QUERY_CAP."""
+    rows, cursor = [], None
+    while True:
+        url = f"{BASE_URL}/databases/{JOB_POSTINGS_DATABASE_ID}/query"
+        payload = {"page_size": page_size}
+        if flt:
+            payload["filter"] = flt
+        if cursor:
+            payload["start_cursor"] = cursor
+        _count("read:job_postings_page")
+        resp = session.post(url, headers=HEADERS, json=payload, timeout=NOTION_TIMEOUT)
+        _raise_with_detail(resp)
+        data = resp.json()
+        for page in data["results"]:
+            rows.append(_job_posting_row(page, company_name_by_page_id))
+        if not data.get("has_more"):
+            break
+        cursor = data["next_cursor"]
+    return rows
+
+
+def _earliest_job_created_time():
+    """created_time of the oldest Job Postings row, or None when empty."""
+    url = f"{BASE_URL}/databases/{JOB_POSTINGS_DATABASE_ID}/query"
+    payload = {"page_size": 1,
+               "sorts": [{"timestamp": "created_time", "direction": "ascending"}]}
+    _count("read:job_postings_page")
+    resp = session.post(url, headers=HEADERS, json=payload, timeout=NOTION_TIMEOUT)
+    _raise_with_detail(resp)
+    results = resp.json()["results"]
+    return _parse_notion_time(results[0]["created_time"]) if results else None
+
+
+def _job_posting_windows(earliest, now):
+    """Calendar-month windows [start, end) covering earliest..now, the last
+    one reaching a day past `now` so a row created mid-read is not missed."""
+    start = earliest.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    stop = now + datetime.timedelta(days=1)
+    windows = []
+    while start <= stop:
+        nxt = (start.replace(day=28) + datetime.timedelta(days=4)).replace(day=1)
+        windows.append((start, nxt))
+        start = nxt
+    return windows
+
+
+def _read_job_window(start, end, company_name_by_page_id):
+    """Every row created in [start, end). A window that comes back at
+    JOB_QUERY_CAP is truncated by definition, so it is halved and read
+    again rather than believed. A window that cannot be halved raises:
+    returning a short list is exactly the silent failure this exists to end."""
+    flt = {"and": [
+        {"timestamp": "created_time", "created_time": {"on_or_after": start.isoformat()}},
+        {"timestamp": "created_time", "created_time": {"before": end.isoformat()}},
+    ]}
+    rows = _fetch_job_postings(flt, company_name_by_page_id)
+    if len(rows) < JOB_QUERY_CAP:
+        return rows
+    mid = (start + (end - start) / 2).replace(second=0, microsecond=0)
+    if not start < mid < end:
+        raise RuntimeError(
+            f"Job Postings: {len(rows)} rows created between {start.isoformat()} and "
+            f"{end.isoformat()} hit Notion's {JOB_QUERY_CAP}-row query limit and the "
+            f"window cannot be split further. Refusing to continue on a partial read.")
+    print(f"     [read] window {start.date()}..{end.date()} hit the "
+          f"{JOB_QUERY_CAP}-row cap; splitting it")
+    return (_read_job_window(start, mid, company_name_by_page_id)
+            + _read_job_window(mid, end, company_name_by_page_id))
+
+
+def _job_posting_row(page, company_name_by_page_id=None):
+    props = page["properties"]
+    relation = (props.get("Company") or {}).get("relation") or []
+    company_page_id = relation[0]["id"] if relation else None
+    return {
+        "page_id": page["id"],
+        "created_time": page.get("created_time"),
+        "url": (props.get("URL") or {}).get("url"),
+        "still_open": (props.get("Still Open") or {}).get("checkbox", False),
+        "title": _plain_text(props.get("Job Title")),
+        "company_page_id": company_page_id,
+        "company": (company_name_by_page_id or {}).get(company_page_id),
+        "has_icon": page.get("icon") is not None,
+        # Everything below is here so the sync can diff a row
+        # against what Notion already holds and skip writing when
+        # nothing moved. These come out of the same response as
+        # the fields above, so reading them costs no extra
+        # request — the sync used to rewrite all of them on every
+        # row every run purely because it had never read them
+        # back and so had nothing to compare against.
+        "score": (props.get("Score") or {}).get("number"),
+        "routing": _select_name(props.get("Routing")),
+        "reasoning": _plain_text(props.get("Reasoning")),
+        "ambiguity_note": _plain_text(props.get("Ambiguity Note")),
+        "ic_role": (props.get("IC Role") or {}).get("checkbox", False),
+        "location": _plain_text(props.get("Location")),
+        "ats": _plain_text(props.get("ATS")),
+        "new_this_run": (props.get("New This Run") or {}).get("checkbox", False),
+        "first_seen": _date_start(props.get("First Seen")),
+        "last_seen": _date_start(props.get("Last Seen")),
+        "application_status": _select_name(props.get("Application Status")),
+        "date_applied": _date_start(props.get("Date Applied")),
+    }
+
+
 def _query_all_job_postings(company_name_by_page_id=None):
     """Read every Job Postings row.
 
@@ -1052,51 +1180,71 @@ def _query_all_job_postings(company_name_by_page_id=None):
     sync_jobs_to_notion() already queries Companies for the reverse
     map — re-querying would add a fourth full table scan to a run that
     already does too many (punch list #12)."""
-    rows, cursor = [], None
-    while True:
-        url = f"{BASE_URL}/databases/{JOB_POSTINGS_DATABASE_ID}/query"
-        payload = {"page_size": 100}
-        if cursor:
-            payload["start_cursor"] = cursor
-        _count("read:job_postings_page")
-        resp = session.post(url, headers=HEADERS, json=payload, timeout=NOTION_TIMEOUT)
-        _raise_with_detail(resp)
-        data = resp.json()
-        for page in data["results"]:
-            props = page["properties"]
-            relation = (props.get("Company") or {}).get("relation") or []
-            company_page_id = relation[0]["id"] if relation else None
-            rows.append({
-                "page_id": page["id"],
-                "url": (props.get("URL") or {}).get("url"),
-                "still_open": (props.get("Still Open") or {}).get("checkbox", False),
-                "title": _plain_text(props.get("Job Title")),
-                "company_page_id": company_page_id,
-                "company": (company_name_by_page_id or {}).get(company_page_id),
-                "has_icon": page.get("icon") is not None,
-                # Everything below is here so the sync can diff a row
-                # against what Notion already holds and skip writing when
-                # nothing moved. These come out of the same response as
-                # the fields above, so reading them costs no extra
-                # request — the sync used to rewrite all of them on every
-                # row every run purely because it had never read them
-                # back and so had nothing to compare against.
-                "score": (props.get("Score") or {}).get("number"),
-                "routing": _select_name(props.get("Routing")),
-                "reasoning": _plain_text(props.get("Reasoning")),
-                "ambiguity_note": _plain_text(props.get("Ambiguity Note")),
-                "ic_role": (props.get("IC Role") or {}).get("checkbox", False),
-                "location": _plain_text(props.get("Location")),
-                "ats": _plain_text(props.get("ATS")),
-                "new_this_run": (props.get("New This Run") or {}).get("checkbox", False),
-                "last_seen": _date_start(props.get("Last Seen")),
-                "application_status": _select_name(props.get("Application Status")),
-                "date_applied": _date_start(props.get("Date Applied")),
-            })
-        if not data.get("has_more"):
-            break
-        cursor = data["next_cursor"]
+    rows = []
+    earliest = _earliest_job_created_time()
+    if earliest is None:
+        return rows
+    seen_ids = set()
+    windows = _job_posting_windows(earliest, datetime.datetime.now(datetime.timezone.utc))
+    for start, end in windows:
+        for row in _read_job_window(start, end, company_name_by_page_id):
+            if row["page_id"] not in seen_ids:
+                seen_ids.add(row["page_id"])
+                rows.append(row)
+    print(f"     [read] Job Postings: {len(rows)} rows in {len(windows)} monthly slice(s)")
     return rows
+
+
+# Six months, as days. Age is measured from First Seen, never from the page's
+# created_time: the September 2026 workspace move re-created every row at once,
+# so created_time says "seven weeks old" for postings first seen in August.
+ARCHIVE_AFTER_DAYS = 183
+
+
+def _archive_job_posting(page_id, dry_run=False):
+    """Move one Job Postings row to Notion's trash (archived=true), which keeps
+    it restorable from Notion's trash for 30 days. Counted under dry-run like
+    every other write, so a dry run reports the volume a real one would cost."""
+    _count("write:job_archive")
+    if dry_run:
+        return None
+    resp = session.patch(f"{BASE_URL}/pages/{page_id}", headers=HEADERS,
+                         json={"archived": True}, timeout=NOTION_TIMEOUT)
+    _raise_with_detail(resp)
+    time.sleep(0.35)
+    return resp.json()
+
+
+def select_archivable_postings(rows, today):
+    """Split `rows` into (to_archive, kept_by_reason). A row is archived only
+    if EVERY condition holds; anything uncertain stays:
+
+      - it is closed. An open posting is live, whatever its age.
+      - it has a URL. A row with none was added by hand and is not the
+        pipeline's to remove (invariant 21 meets the same six rows).
+      - it carries no Application Status and no Date Applied. Those rows are
+        the application history, and Application Status is a human judgement
+        the pipeline never touches (invariant 3's reasoning).
+      - First Seen is present and older than ARCHIVE_AFTER_DAYS. A blank First
+        Seen means the age is unknown, and unknown is not old.
+
+    `today` is a datetime.date. Dates compare as ISO strings."""
+    cutoff = (today - datetime.timedelta(days=ARCHIVE_AFTER_DAYS)).isoformat()
+    to_archive, kept = [], collections.Counter()
+    for row in rows:
+        if row.get("still_open"):
+            kept["still open"] += 1
+        elif not row.get("url"):
+            kept["no URL (added by hand)"] += 1
+        elif row.get("application_status") or row.get("date_applied"):
+            kept["has application history"] += 1
+        elif not row.get("first_seen"):
+            kept["First Seen blank (age unknown)"] += 1
+        elif row["first_seen"][:10] >= cutoff:
+            kept["closed but newer than 6 months"] += 1
+        else:
+            to_archive.append(row)
+    return to_archive, kept
 
 
 def _backfill_applied_dates(existing_rows, today, dry_run=False):
@@ -1113,7 +1261,7 @@ def _backfill_applied_dates(existing_rows, today, dry_run=False):
     above would otherwise never revisit.
 
     Only ever fills a blank Date Applied. A row already carrying a date —
-    whether the owner typed it in or a previous run stamped it — is left
+    whether the owner typed it in themselves or a previous run stamped it — is left
     alone, and no other Application Status value is touched."""
     backfilled = 0
     for row in existing_rows:

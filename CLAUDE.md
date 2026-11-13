@@ -43,6 +43,9 @@ python run.py --dry-run        # rehearsal: no writes, no API spend
 python run.py                  # the real thing
 python -m pytest tests/        # the offline checks
 python output_excel.py         # rebuild the workbook from existing output/*.json
+python archive_old_postings.py  # dry-run: closed postings first seen >6 months ago (--apply to archive)
+python close_nonsenior_tiered_postings.py  # one-off, dry-run: close open non-senior rows at senior-filter tiers (--apply)
+python clear_new_flag_nonsenior_biotech.py # one-off, dry-run: untick New This Run on non-senior Large Biotech rows (--apply)
 ```
 
 Requires a `.env` in the repo root with `NOTION_API_KEY`, `NOTION_DATABASE_ID`,
@@ -129,10 +132,14 @@ real failure, so preserve them unless the task explicitly says otherwise.
    company forever.
 9. **Notion is authoritative for "New This Run"**, not `output/seen_jobs.json`. Two
    independent records of the same fact drifted once already.
-10. **Anything that changes a score must change the fingerprint.** `_prompt_fingerprint()`
-    hashes the rubric, the model id, the keyword list, and `SCORER_VERSION`. Change how
-    scoring works without bumping one of those and the cache serves stale answers
-    forever, silently.
+10. **A rubric edit applies going forward; everything else that changes a score must
+    change the fingerprint.** `_prompt_fingerprint()` hashes the model id, the keyword
+    list, and `SCORER_VERSION`. The rubric text is deliberately *not* hashed (the owner's
+    decision, 2026-10-05): editing `scoring/rubric.md` leaves cached scores alone and
+    only newly scored postings see the new rubric. Each cache entry records
+    `rubric_hash` for provenance. To force a full re-score after a rubric edit, bump
+    `SCORER_VERSION`. Change the model, keyword list or prompt shape without bumping
+    one of those and the cache serves stale answers forever, silently.
 11. **`Failing Since` dates the outage, not the run.** It is set when a company
     crosses from OK into any failure status and left alone for as long as it keeps
     failing, so the Needs Manual Check view can be sorted oldest-first. Re-stamping
@@ -292,6 +299,69 @@ real failure, so preserve them unless the task explicitly says otherwise.
     individually was the tempting version and the wrong one: the failure is the
     side-effect clearing itself, and a fourth case would have gone the same way.
 
+24. **The senior filter runs before anything downstream sees a job.** For a
+    `Company Tier` in `SENIOR_FILTER_TIERS` (Large MedTech, Large Biotech, Large
+    Misc), `prepare_jobs()` in `run.py` drops every title
+    that does not match `SENIOR_TITLE_RE`, inside `run_scrapers()`, before
+    `all_jobs.extend()`. `mark_new_postings()`, `score_all()` and the sync all read
+    that list, so a filtered role that got past it would be scored (money) and
+    written to Notion (clutter) before anything could remove it. A new branch that
+    extends `all_jobs` must go through `prepare_jobs()` too — it also copies
+    `company_description` and the tier onto each job. The filter is per-company-tier
+    only; every other company keeps every posting.
+
+25. **A scraper must raise on a response it cannot parse; it returns `[]` only for
+    a board it recognised as empty.** "Page loaded, my selectors found nothing" is
+    indistinguishable from an empty board unless the scraper insists on positive
+    evidence, and a false zero is the failure Workday-on-HTML produced for every
+    Workday company (and the close pass reads it as "all postings gone"). The new
+    scrapers raise `scrapers.common.ScrapeShapeError`: Oracle raises on a reply with
+    no `items[0].requisitionList` (which is also what caught a missing `expand`
+    parameter during development); SuccessFactors believes a page only with rows
+    plus a total, or the server-rendered "Search results for" heading with no rows;
+    Workday raises on an answer with neither `jobPostings` nor `total`.
+
+26. **A platform label written from a URL shape is a guess.** Boston Scientific,
+    Terumo and Teleflex were stamped Avature/Taleo from `/go/<category>/<id>/` URLs
+    that are actually SuccessFactors RMK sites. Check a label against what the
+    scraper can read before building a scraper for it — two scrapers were nearly
+    written for platforms nobody was on.
+
+27. **Every outbound HTTP call needs a request timeout *and* a Retry adapter with
+    `respect_retry_after_header=False`; a per-company failure never aborts
+    `run_scrapers`.** `timeout=` bounds a connect or a read, not the sleep urllib3
+    does between retries: `Retry.sleep_for_retry` obeys a server's `Retry-After`
+    header, and a site answering 429/503 with a huge value froze a run for ~3 hours
+    inside `detect_embedded_board()` with every timeout correctly set. So
+    `http_client.third_party_session` (total=2, backoff_factor=1, header ignored)
+    is what `find_embedded_board.py` and `scrapers/html_generic.py` use to fetch
+    arbitrary company sites, and `notion/client.py` passes `NOTION_TIMEOUT` (30 s)
+    on every call. **The patient `session` in `http_client.py` still honours
+    `Retry-After`**, as do the API scrapers on it — see punch list #28. Any
+    call that touches a third-party site outside a `try` in `run_scrapers` is a way
+    for one company to kill the run; `detect_embedded_board` is now wrapped, and
+    the `[detect] <company>` line printed before it is what names the culprit
+    next time.
+
+28. **A full read of Job Postings must be sliced; Notion silently stops a single
+    query at 10,000 rows.** `has_more` comes back false and the rest is simply not
+    delivered, with no error. The database held 11,057 rows (8,368 open) while
+    `_query_all_job_postings()` returned exactly 10,000, so the create-vs-update
+    lookup by URL, the close pass and the delta comparison were all blind to the
+    overflow: a posting past the cutoff reads as new and gets a second row
+    (invariant 22), and a gone one is never closed. The read now walks calendar
+    months of `created_time`, halves any window that comes back at
+    `JOB_QUERY_CAP`, and raises if a window cannot be halved. Do not "simplify" it
+    back to one query. `created_time` is used because every row has it; it is **not**
+    a measure of age, since the September 2026 workspace move re-created every row
+    in two months. Age is `First Seen`.
+
+    **Archiving** (`archive_old_postings.py`, `select_archivable_postings()`) moves
+    a row to Notion's trash (restorable 30 days) only if it is closed, has a URL, has
+    no Application Status or Date Applied, and has a First Seen older than
+    `ARCHIVE_AFTER_DAYS`. A blank First Seen means unknown age, which stays. It is
+    dry-run by default and is deliberately **not** wired into `run.py`.
+
 ## Traps
 
 - **`output/` is gitignored in full (except `.gitkeep`) but holds real state.** `score_cache.json` (~500 KB)
@@ -301,9 +371,10 @@ real failure, so preserve them unless the task explicitly says otherwise.
   `notion.state` rather than let it touch the real file — a test run that advances
   `last_run` to today makes the next real run stamp closing postings with the date of
   a test.
-- **Any change to the rubric, the scoring prompt, the model, or the keyword list
-  invalidates the entire cache** and triggers a full re-score of ~850 jobs. That is
-  correct behavior and it costs real money. Say so before it happens.
+- **A rubric edit does not re-score anything** (invariant 10): only new postings use
+  it. A change to the scoring prompt shape, the model, the keyword list, or
+  `SCORER_VERSION` invalidates the entire cache and triggers a full re-score of
+  thousands of jobs, which costs real money. Say so before it happens.
 - **`scoring/rubric.md` is the only rubric the code reads.** If you keep a second copy
   anywhere outside the repo — a doc, a wiki, a chat project — that copy is a read-only
   mirror of this file, not a second original: edit the repo copy and re-stamp the other
@@ -382,6 +453,72 @@ issues.
 When asked to work on a numbered item, read that item in full before editing, and
 check its cross-references — several items depend on another landing first. Update the
 item's status line and the summary table when it lands.
+
+## Large MedTech tier and URL-based scrapers
+
+MedTech companies over $1B revenue (37 when the tier launched, 46 on 2026-11-13) form
+their own tier so they cannot flood the list. For them only: scrape everything, **keep, score and sync only senior titles**.
+
+**Other tiers (added after this section was written).** `SENIOR_FILTER_TIERS` in
+`run.py` now holds three tiers: Large MedTech, **Large Biotech** (added 2026-10-30)
+and **Large Misc** (2026-11-11). All three get the same `SENIOR_TITLE_RE` filter
+and the same Workday senior search terms, so everything below about the filter
+applies to each of them.
+
+Putting a tier behind the filter *after* its companies were scraped unfiltered
+strands their non-senior rows in Notion: those URLs vanish from every run, the
+company scrapes OK, and the close pass queues them all at once. One run wanted to
+close 4,557 of 9,787 open rows (46.6%) and the 25% valve aborted it, correctly,
+since it cannot tell a deliberate filter change from a systemic failure. Two
+one-off scripts clean up deliberately instead, both dry-run by default:
+`close_nonsenior_tiered_postings.py` closes open non-senior rows at tiered
+companies (never a row with an Application Status or Date Applied, never one whose
+Company relation does not resolve; stamps `Last Seen` per invariant 14), and
+`clear_new_flag_nonsenior_biotech.py` only unticks `New This Run` on the same rows.
+Adding a fourth tier means adding it to `SENIOR_FILTER_TIERS` and then running
+the close script, in that order.
+
+- **Filter:** `SENIOR_TITLE_RE` in `run.py` (named constant, edit it there):
+  vp / svp / vice president / director / head of / general manager / chief. Runs in
+  `prepare_jobs()`, which logs "kept X of Y (senior filter)" per company. Known
+  noise: "Executive Assistant, VP …" and "Associate Director" pass.
+- **Scorer:** `score_jobs._tier_line()` adds "Company tier: Large MedTech (>$1B
+  revenue)" to each tiered job's entry in the **per-job message only**. The system
+  prompt, fingerprint and cache key (job URL) are untouched, and untiered jobs'
+  messages are byte-identical, so cached scores stay valid. Changing that wording
+  needs a `SCORER_VERSION` bump. Why it exists: the rubric's must-have is
+  $10M-$150M revenue, so a VP at a $30B company would score 3-4 regardless.
+- **`URL_BASED_PLATFORMS`** (`run.py`) lists platforms whose scraper is
+  `fetch_jobs(company_name, careers_url)`. `run_scrapers` hands them the saved
+  Careers URL; there is no guessed-slug fallback and no URL means `No Careers URL`.
+  Workday predates this and keeps its own branch. **`PLATFORM_ALIASES`** adds
+  spellings `resolve_scraper()` should accept ("Oracle Cloud HCM", "SAP
+  SuccessFactors"). "Oracle Taleo" is deliberately not an alias of Oracle Recruiting
+  Cloud; no Taleo scraper exists.
+- **Shared rules** (`scrapers/common.py`): one query per term in
+  `SENIOR_SEARCH_TERMS` instead of paging a whole board, 0.5 s between requests, a
+  normal User-Agent, dedupe by URL, `ScrapeShapeError` (invariant 25).
+- **Workday** (existing scraper): gains `search_terms=` (used for the tier) and a
+  shape check. Job URLs keep the `/en-US/{site}` form, since a URL is a posting's
+  identity (invariant 22). Search is full-text, so a term over-fetches (Medtronic:
+  984 postings for 5 terms, 21 kept); the regex does the real filtering.
+  Failure modes: saved URL not a `myworkdayjobs.com` board; shared tenants (Masimo
+  sits on Danaher's) need a facet.
+- **Oracle Recruiting Cloud** (`scrapers/oracle_rc.py`): `GET
+  /hcmRestApi/resources/latest/recruitingCEJobRequisitions` with `onlyData=true`,
+  `expand=requisitionList.secondaryLocations` (**required**, or no list comes back)
+  and `finder=findReqs;siteNumber=…,limit=25,offset=…,keyword=<term>,sortBy=POSTING_DATES_DESC`.
+  siteNumber is the last segment of the saved URL. Failure modes: URL not
+  `…/hcmUI/CandidateExperience/<lang>/sites/<site>`; reply without a requisition list.
+- **SuccessFactors** (`scrapers/successfactors.py`): the server-rendered RMK page
+  `GET /search/?q=<term>&startrow=<n>`, `tr.data-row`, 25 per page, total from
+  `.paginationLabel`. Failure modes, all raised: JS-rendered shells (B. Braun),
+  non-RMK sites (Steris, Straumann), and `career{N}.successfactors.com/career?company=`
+  pages, which raise "needs a browser" without a request.
+- **iCIMS, Avature, Taleo: not built.** No Large MedTech company needed them (see
+  invariant 26). Add the name to `URL_BASED_PLATFORMS` when a scraper lands.
+- `add_large_medtech_companies.py` created the rows; `restamp_score_cache.py` keeps
+  existing scores valid across a narrow rubric edit (dry-run by default).
 
 ## Conventions
 

@@ -119,8 +119,9 @@ def print_api_report(dry_run=False):
 # (Head of Product, GM North America, CCO).
 LARGE_MEDTECH_TIER = "Large MedTech"
 LARGE_BIOTECH_TIER = "Large Biotech"
+LARGE_MISC_TIER = "Large Misc"
 # Every tier the senior filter and the senior search terms apply to.
-SENIOR_FILTER_TIERS = {LARGE_MEDTECH_TIER, LARGE_BIOTECH_TIER}
+SENIOR_FILTER_TIERS = {LARGE_MEDTECH_TIER, LARGE_BIOTECH_TIER, LARGE_MISC_TIER}
 SENIOR_TITLE_RE = re.compile(
     r"\b(vp|svp|vice president|director|head of|general manager|chief)\b",
     re.IGNORECASE,
