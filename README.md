@@ -17,18 +17,19 @@ removed — that stays in a private database, not committed here.*
 
 ## Scale
 
-As of the 2026-10-26 run, against the private database this is a copy of:
+Against the private database this is a copy of:
 
-- **1,502 companies** tracked (medtech, digital health, healthcare-focused
-  PE/VC), of which 49 are in a separate "Large MedTech" tier. 946 scraped
-  cleanly on the last pass; the rest are surfaced in a Needs Manual Check
+- **1,506 companies** tracked (medtech, digital health, healthcare-focused
+  PE/VC) as of 2026-11-13, of which 58 sit in three separate large-company
+  tiers (46 Large MedTech, 8 Large Biotech, 4 Large Misc). 923 scraped
+  cleanly on the latest count; the rest are surfaced in a Needs Manual Check
   view instead of being silently dropped.
-- **11,057 job postings** in the database: 8,368 still open and 2,689
-  closed, with 1,892 of the open ones scored matches. That last run
-  handled 5,309 postings across 306 companies with open roles. A
+- **11,057 job postings** in the database as of the 2026-10-26 run: 8,368
+  still open and 2,689 closed, with 1,892 of the open ones scored matches.
+  That run handled 5,309 postings across 306 companies with open roles. A
   steady-state run writes roughly a hundred rows to Notion rather than
   all of them.
-- **13 ATS platforms** read through their public endpoints, and **204
+- **13 ATS platforms** read through their public endpoints, and **220
   offline tests**.
 
 ## What it does
@@ -46,8 +47,8 @@ As of the 2026-10-26 run, against the private database this is a copy of:
    only *looks* in-house is checked first for an ATS board it embeds,
    redirects to or links — but only when the page names exactly one, so a
    careers page listing a portfolio of other companies' boards is refused
-   rather than guessed at. Companies in the "Large MedTech" tier (over $1B
-   revenue) are scraped in full but only their senior titles (VP, director,
+   rather than guessed at. Companies in the large-company tiers (Large MedTech, over $1B
+   revenue, plus Large Biotech and Large Misc) are scraped in full but only their senior titles (VP, director,
    head of, general manager, chief) are kept, scored and synced, so they
    cannot flood the list.
 3. **Scores every posting** against a rubric (`scoring/rubric.md`) using
@@ -194,9 +195,9 @@ you have run the pipeline at least once.
 
 You'll need two Notion databases:
 
-**Target List** — Company (title), Sector / Focus (text), HQ (text),
+**Companies** — Company (title), Sector / Focus (text), HQ (text),
 Source (text), ATS Platform (text), Scrape Method (text), Careers URL
-(URL type), Website (URL type), Company Tier (select, optional), Jobs (relation → Job Postings), Scrape
+(URL type), Website (URL type), Company Tier (select: Large MedTech / Large Biotech / Large Misc, optional), Jobs (relation → Job Postings), Scrape
 Status (select: OK / Failed / No Scraper / No Careers URL), Scrape Note
 (text), Failing Since (date)
 
@@ -206,7 +207,7 @@ resolves, a blank square where it genuinely doesn't. A "Needs Manual
 Check" view filtered on `Scrape Status is not OK` and sorted by
 `Failing Since` ascending puts the oldest breakage first.
 
-**Job Postings** — Job Title (title), Company (relation → Target List),
+**Job Postings** — Job Title (title), Company (relation → Companies),
 Score (number), Routing (select: Scored / Needs Review / Non-fit),
 Reasoning (text), Ambiguity Note (text), IC Role (checkbox), Location
 (text), URL (url), ATS (text), First Seen / Last Seen (date), Still Open
@@ -252,7 +253,7 @@ detected automatically.
 python -m pytest tests/
 ```
 
-The suite (204 tests) is offline — no network, no API keys, no Notion, and it stubs
+The suite (220 tests) is offline — no network, no API keys, no Notion, and it stubs
 the on-disk run state so a test run can never advance it. It covers the
 close-pass rules that decide whether a posting is retired (company-relation
 resolution, the scraped-successfully guard, the 25% ratio valve, its 20-row
@@ -260,8 +261,7 @@ floor, the empty-database case), the delta sync and the comparison traps
 that would otherwise rewrite every row on every run, the one-row-per-URL
 rule and the "New This Run" reset, each ATS scraper's slug extraction and
 job-dict contract (including the URL-based Oracle and SuccessFactors scrapers
-and their refusal to report a false empty board), the Large MedTech senior-title
-filter, embedded-board detection and its refusal to guess when a
+and their refusal to report a false empty board), the senior-title filter for the large-company tiers, embedded-board detection and its refusal to guess when a
 page names several boards, and the checks that tell a never-researched field
 apart from one holding a wrong value.
 
