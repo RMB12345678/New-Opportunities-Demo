@@ -19,6 +19,7 @@ filled with a deadline that would read as a start date and be wrong in
 both direction and meaning.
 """
 from http_client import session
+from scrapers.common import require_list
 
 from ats_finder.find_ats import slugify
 
@@ -62,7 +63,7 @@ def fetch_jobs(company_name, slug=None):
     slug = slug or slugify(company_name)
     resp = session.get(f"https://{slug}.pinpointhq.com/postings.json", timeout=15)
     resp.raise_for_status()
-    jobs = resp.json().get("data", [])
+    jobs = require_list(resp.json(), "data", "Pinpoint")
 
     return [
         {

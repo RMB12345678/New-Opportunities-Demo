@@ -21,7 +21,7 @@ from scrapers.common import ScrapeShapeError, dedupe_by_url
 from notion.client import SCRAPE_OK, SCRAPE_FAILED, SCRAPE_NO_URL
 
 
-def _fake(name, careers_url):
+def _fake(name, careers_url, search_terms=None):
     return [{"company": name, "title": "VP, X", "url": "https://x/1", "location": None,
              "posted_at": None, "source_ats": "Fake"}]
 
@@ -47,7 +47,7 @@ def test_taleo_is_not_oracle_recruiting_cloud(fake_platforms):
 
 
 def _row(**kw):
-    base = {"company": "Big Co", "tier": None, "sector": "s", "scrape_method": "API",
+    base = {"page_id": "pg-big", "company": "Big Co", "tier": None, "sector": "s", "scrape_method": "API",
             "ats_platform": "Oracle Recruiting Cloud", "careers_url": "https://h/x"}
     base.update(kw)
     return base
@@ -55,20 +55,20 @@ def _row(**kw):
 
 def test_url_based_scraper_gets_the_saved_url(fake_platforms):
     jobs, ok, statuses = run.run_scrapers([_row()])
-    assert len(jobs) == 1 and "Big Co" in ok and statuses[0]["status"] == SCRAPE_OK
+    assert len(jobs) == 1 and "pg-big" in ok and statuses[0]["status"] == SCRAPE_OK
 
 
 def test_url_based_without_url_is_no_careers_url_not_a_guess(fake_platforms):
     jobs, ok, statuses = run.run_scrapers([_row(careers_url=None)])
-    assert jobs == [] and "Big Co" not in ok and statuses[0]["status"] == SCRAPE_NO_URL
+    assert jobs == [] and "pg-big" not in ok and statuses[0]["status"] == SCRAPE_NO_URL
 
 
 def test_url_based_raise_is_failed_and_not_scraped_ok(monkeypatch):
-    def boom(name, url):
+    def boom(name, url, search_terms=None):
         raise ScrapeShapeError("JS-rendered shell")
     monkeypatch.setitem(run.SCRAPERS, "SuccessFactors", boom)
     jobs, ok, statuses = run.run_scrapers([_row(ats_platform="SuccessFactors")])
-    assert "Big Co" not in ok
+    assert "pg-big" not in ok
     assert statuses[0]["status"] == SCRAPE_FAILED and "JS-rendered" in statuses[0]["note"]
 
 

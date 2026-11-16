@@ -76,6 +76,11 @@ def _location(position):
     return office or None
 
 
+class _NoBoard(RuntimeError):
+    """This host gave a definite "no such board" answer (the 307 to the
+    marketing site, or a 404). Only this lets fetch_jobs try the next host."""
+
+
 def fetch_jobs(company_name, slug=None):
     slug = slug or slugify(company_name)
 
@@ -88,19 +93,26 @@ def fetch_jobs(company_name, slug=None):
             resp = session.get(f"https://{slug}.{host}/xml", timeout=20,
                                allow_redirects=False)
             if resp.is_redirect or resp.is_permanent_redirect:
-                raise RuntimeError(
+                raise _NoBoard(
                     f"no Personio board at {slug}.{host} (it redirects to "
                     f"{resp.headers.get('Location')}, which is how Personio "
                     f"answers for a tenant that does not exist)")
+            if resp.status_code == 404:
+                raise _NoBoard(f"no Personio board at {slug}.{host} (HTTP 404)")
             resp.raise_for_status()
             # .content, not .text: the document declares its own encoding
             # in the XML prolog, and handing ElementTree a str that
             # requests already decoded by guesswork is how accented office
             # names ("Münster") turn into mojibake or a ValueError.
             root = ET.fromstring(resp.content)
-        except Exception as e:
+        except _NoBoard as e:
             last_error = e
             continue
+        # Anything else (timeout, 5xx, bad XML) is NOT an answer about which
+        # host the tenant lives on. Falling to .de on it would, for a tenant
+        # that answers on both, rebuild every posting URL on the other host:
+        # every row closes and re-creates. It propagates, so the company is
+        # Failed and invariant 2 protects its rows.
 
         jobs = []
         for position in root.findall("position"):

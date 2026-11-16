@@ -24,7 +24,26 @@ unreachable or stale URL is a scrape failure, which `sync_scrape_status()`
 already surfaces, and judging liveness here would collide with invariant 1
 (a fetch that fails to run is not evidence the URL is wrong).
 """
+import re
 from urllib.parse import urlparse
+
+_BARE_HOST_PATH = re.compile(r"^[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)+(?:[/?#]\S*)?$")
+
+
+def ensure_scheme(value):
+    """Prepend https:// to a bare `host.tld/path` answer; leave anything else
+    alone. The research steps ask for a URL and sometimes get `example.com/
+    careers`: saved as-is it fails is_usable_careers_url() and is re-researched
+    (paid) every run, and a homepage answer with no scheme yields no host, so
+    the company got the permanent blank icon (invariant 16) despite a real
+    answer. Deliberately narrow - a dot, no whitespace, no scheme - so "N/A",
+    a sentence, or a word is never turned into a URL."""
+    if not value:
+        return value
+    text = value.strip()
+    if "://" in text or not _BARE_HOST_PATH.match(text):
+        return value
+    return "https://" + text
 
 # Hosts that can never be any kind of careers destination: document and
 # file-storage products. A link to one of these is always a paste error,

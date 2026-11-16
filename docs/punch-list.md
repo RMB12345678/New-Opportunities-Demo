@@ -1,12 +1,14 @@
 # Job Agent Punch List
 
-27 improvements, ordered by how much each changes the quality of what lands in the
+50 improvements, ordered by how much each changes the quality of what lands in the
 Notion dashboard. Verified against commit `243b2f2` on 2026-08-22. #18 and #19 were
 found 2026-08-23 during a live `--dry-run`, #20 on 2026-09-09 while measuring a
 real run, and #23 on 2026-09-29 by auditing the Job Postings database itself, all
-added after the original 17.
+added after the original 17. #29-#51 (there is no #40; it was removed on 2026-11-16) came from a read-only code audit on 2026-11-16
+(commit `48d7891`); they are numbered in the audit's severity order and have their
+own three batches (A, B, C) at the bottom.
 
-**As of 2026-10-02: 10 done, 1 resolved as intentional, 4 partial, 12 open.** #24-#27 are Large MedTech follow-ups.
+**As of 2026-11-16: 10 done, 1 resolved as intentional, 2 left as is by decision (#50, #51), 4 partial, 33 open.** #24-#27 are Large MedTech follow-ups; #28 came from the 2026-10-26 hang; #29-#51 are the 2026-11-16 audit. #1-#28 have not been re-audited since 2026-10-26, so check an item's own status line before trusting this count.
 Each item carries its own status line with what actually landed.
 
 Severity is damage to the output. Effort is a rough estimate for a Claude-assisted
@@ -19,14 +21,14 @@ priority order, because several items depend on another landing first.
 | 2 | A failed scrape marks live jobs as closed | Critical | 45 m | Done |
 | 3 | A truncated research reply becomes a permanent "not found" | Critical | 30 m | Done (recovery pending) |
 | 4 | Score cache ignores rubric changes | Critical | 30 m | Done |
-| 5 | HTML scraper collapses a company's jobs into one URL | High | 1–2 h | Open |
+| 5 | HTML scraper collapses a company's jobs into one URL | High | 1–2 h | Done (step 5 open) |
 | 6 | Two rubric copies, already out of sync | High | 30 m | Done |
 | 7 | No retry or rate-limit handling anywhere | High | 2 h | Done (partial) |
-| 8 | Prompt caching probably isn't firing | High | 45 m | Open |
+| 8 | Prompt caching probably isn't firing | High | 45 m | Partial |
 | 9 | Two sources of truth for "new this run" | High | 30 m | Partial |
-| 10 | Placeholder text leaks into the scoring prompt | Medium | 20 m | Open |
-| 11 | Jobs without a URL get paid for, then dropped | Medium | 30 m | Open |
-| 12 | Four full Notion table scans per run | Medium | 1 h | Open |
+| 10 | Placeholder text leaks into the scoring prompt | Medium | 20 m | Done |
+| 11 | Jobs without a URL get paid for, then dropped | Medium | 30 m | Done |
+| 12 | Four full Notion table scans per run | Medium | 1 h | Done |
 | 13 | Scraping is fully sequential | Medium | 1–2 h | Open |
 | 14 | Scheduling will silently destroy both caches | Medium | 2–3 h | Open |
 | 15 | Keyword filter is substring-based and cached forever | Medium | 30 m | Resolved |
@@ -41,8 +43,30 @@ priority order, because several items depend on another landing first.
 | 24 | Large MedTech companies no scraper reaches | High | 3-4 h | Open |
 | 25 | JS-rendered SuccessFactors sites need a browser | Medium | 3 h | Open |
 | 26 | SENIOR_TITLE_RE lets noise through | Low | 20 m | Open |
-| 27 | resolve_scraper reads platform names out of negative text | Medium | 30 m | Open |
-| 28 | Scrapers can still sleep on a server's Retry-After | High | 1 h | Open |
+| 27 | resolve_scraper reads platform names out of negative text | Medium | 30 m | Done |
+| 28 | Scrapers can still sleep on a server's Retry-After | High | 1 h | Done |
+| 29 | A failed embedded board falls through to HTML and closes the company's rows | High | 20 m | Done |
+| 30 | SmartRecruiters postings change URL at the 100-detail cap | High | 30 m | Done |
+| 31 | score_cache.json is rewritten non-atomically after every batch | High | 20 m | Done |
+| 32 | A guessed slug is accepted as the company's board | High | 1–2 h | Done (steps 1–2) |
+| 33 | A failed score overwrites Routing, Reasoning and IC Role | Medium | 30 m | Done |
+| 34 | Row creation is transparently retried and can duplicate | Medium | 30 m | Done |
+| 35 | scraped_ok and the Company relation are keyed by name | Medium | 1 h | Done |
+| 36 | Five scrapers read a missing key as an empty board | Medium | 30 m | Done |
+| 37 | Oracle and SuccessFactors always scrape senior terms only | Medium | 30 m | Done |
+| 38 | An interrupted sync loses New This Run on rows it created | Medium | 45 m | Done |
+| 39 | Scorer output is not validated before use | Medium | 30 m | Done |
+| 41 | rubric.md is read with the Windows default encoding | Medium | 5 m | Done |
+| 42 | Scrape Note comparison can never be equal for connection errors | Low | 20 m | Done |
+| 43 | Personio host fallback changes URL identity | Low | 20 m | Done |
+| 44 | Scheme-less URLs from research loop or blank-stamp | Low | 20 m | Done |
+| 45 | HTML scraper mojibake and unjoined relative links | Low | 30 m | Done |
+| 46 | sniff_ats_from_page honours Retry-After on third-party sites | Low | 15 m | Done |
+| 47 | Hardcoded Job Postings fallback id looks stale | Low | 5 m | Done |
+| 48 | A blank-named Companies row costs a paid search every run | Low | 10 m | Done |
+| 49 | Senior search terms lack "vp" and "svp" | Low | 5 m | Done |
+| 50 | Unanimity is not ownership in board detection | Low | decision | Left as is |
+| 51 | --dry-run overwrites jobs.json and the workbook | Low | 15 m | Left as is |
 
 ---
 
@@ -255,6 +279,8 @@ def _prompt_fingerprint():
 ## 5. The HTML scraper collapses a company's jobs into one URL
 **High** · `scrapers/html_generic.py`
 
+**Status: partly done, 2026-11-16 (branch `fix/remaining-items`).** Fix steps 1-4 landed (batch C already did the `urljoin`/non-link part of step 1): `urljoin` on every href; the OVERRIDES branch tries the element, `find_parent("a")` then `find("a")`; a job with no usable link is skipped and counted (`Acme: 6 jobs, 2 skipped (no link)`) instead of borrowing the careers URL; dedup is on the resolved URL, not the title. If titles were found but **none** has a usable link the scraper raises `ScrapeShapeError` rather than returning `[]` (invariant 23). **Step 5 (Playwright for JS-rendered pages) is not done**: it needs a new dependency, which CLAUDE.md says to ask about. Companies that previously collapsed to one row at the careers URL will now lose that row (closed) and gain real ones, or fail visibly. Tests: `test_linkless_titles_are_skipped_...`, `test_titles_with_no_usable_link_at_all_raise_...`, `test_dedup_is_on_url_not_title`, `test_override_selector_finds_the_anchor_...`.
+
 Affects the ~90 companies with no real ATS.
 
 - `"url": link if link else careers_url` — every job whose anchor had no usable href
@@ -359,6 +385,8 @@ raises having already spent the money, leaving Notion half-written with no resum
 ## 8. Prompt caching probably isn't firing
 **High** · `scoring/score_jobs.py` → `_score_batch()`
 
+**Status: partly done, 2026-11-16 (branch `fix/remaining-items`).** Steps 1 and 3 landed: each response's `usage` is summed (`score_jobs.USAGE`), `usage_report()` prints tokens, an estimated cost and whether caching is firing at the end of `score_all()`, and the run digest carries the estimate. **Step 2 (pad the cached prefix with scoring examples) is deliberately NOT done: it changes the system prompt, so it changes the fingerprint and re-scores every cached job.** Read the first real run's `[score]` line first: if it says the cache is not firing, step 2 is a separate, paid decision. The price constants in `PRICE_PER_MTOK` are an estimate to check against current pricing. Tests: `test_usage_is_summed_from_each_response`, `test_report_says_when_caching_is_not_firing`, `test_cost_estimate_weights_cache_reads_and_writes`.
+
 `cache_control: ephemeral` is set, but Haiku's minimum cacheable prefix is 2048 tokens
 and the system prompt is roughly 1500–1700. Below the floor the marker is ignored
 silently. Nothing reads the `usage` block, so there is no way to tell.
@@ -374,6 +402,8 @@ silently. Nothing reads the `usage` block, so there is no way to tell.
 
 ## 9. Two sources of truth for "new this run"
 **High** · `scoring/track_new_postings.py`, `notion/client.py`, `output_excel.py`
+
+**Status: partly done, 2026-11-16 (branch `fix/remaining-items`).** Steps 1-2 landed: `sync_jobs_to_notion()` writes `job["is_new"] = is_new_in_notion` onto the job as it goes (the same list `main()` writes to `jobs.json` and `build_workbook()` reads), so the Excel New This Run tab now agrees with the Notion view. **Step 3 (delete `track_new_postings.py` and `seen_jobs.json`) is not done**: `seen_jobs.json` is run history CLAUDE.md says not to delete casually, and `mark_new_postings()` still supplies `first_seen` and the step-6 count. Test: `test_sync_writes_is_new_back_onto_the_jobs`.
 
 **Partial, 2026-08-24.** The `--dry-run` leak in `mark_new_postings()` is
 fixed (it takes a `dry_run` parameter and skips `_save_seen()`), so a dry run
@@ -393,6 +423,8 @@ The two artifacts of one run disagree.
 ## 10. Placeholder marker text leaks into the scoring prompt
 **Medium** · `run.py` → `run_scrapers()`
 
+**Status: done, 2026-11-16 (branch `fix/remaining-items`).** `run.clean_sector()` returns `None` for "Not found...", "AMBIGUOUS..." and "N/A" markers (case-insensitive prefix), used by `prepare_jobs()`. Only the copy onto jobs changes; the Notion field keeps its marker (invariant 8). Cached scores are keyed by URL and are **not** re-scored by this; only postings scored from now on see `unknown`. Tests: `test_clean_sector_drops_markers_and_keeps_descriptions`, `test_prepare_jobs_uses_the_cleaned_sector`.
+
 `job["company_description"] = row.get("sector")` copies Sector / Focus verbatim,
 including markers like `"Not found (checked, no info located — clear this field to
 retry)"` and `"AMBIGUOUS — see console output from this run for candidates"`.
@@ -411,6 +443,8 @@ The prompt already renders `None` as `'unknown'`, which is the right signal.
 ## 11. Jobs without a URL get scored, then dropped
 **Medium** · `scoring/score_jobs.py`, `notion/client.py`
 
+**Status: done, 2026-11-16 (branch `fix/remaining-items`).** Fix step 1: `drop_urlless_jobs()` runs right after `dedupe_jobs_by_url()` in `main()`, before scoring, and prints how many were dropped and from which companies. Steps 2-3 were not needed after #5's change. Tests: `test_urlless_jobs_are_dropped_and_counted`, `test_nothing_is_reported_when_every_job_has_a_url`.
+
 `_job_key()` falls back to `"{company}::{title}"`, so URL-less jobs get scored and
 cached. Then `sync_jobs_to_notion` hits `if not url: continue` and drops them.
 
@@ -423,6 +457,8 @@ cached. Then `sync_jobs_to_notion` hits `if not url: continue` and drops them.
 
 ## 12. Four full Notion table scans per run
 **Medium** · `notion/client.py`, `run.py` → `main()`
+
+**Status: done, 2026-11-16 (branch `fix/remaining-items`).** The four `get_companies_missing_*` selectors are pure filters over an optional `companies` list (`_rows()`), and the four `fill_missing_*` passes accept it. `main()` now reads Companies **twice**: once for steps 1-3, once after step 3 for step 4 and the scrape (see the comment there for why a stale first snapshot is safe: those steps only select rows lacking something the earlier one fills). One behaviour difference: a row whose step-1 research found an ATS but no Careers URL now gets its URL looked up on the next run rather than the same run. `notion/client.py` also raises a `RuntimeError` naming `.env` instead of a bare `KeyError` for a missing key. Tests: `test_selectors_do_not_rescan_notion_when_given_a_list`, `test_selectors_still_read_notion_when_given_nothing`, `test_missing_env_var_names_the_env_file_and_not_the_value`.
 
 All three `get_companies_missing_*` helpers call `get_all_companies()` internally, and
 `main()` calls it once more. 4 × 4 paginated requests over unchanged data. It is also
@@ -509,6 +545,8 @@ A rubric decision, not a bug.
 
 ## 17. No run summary, no cost visibility, no tests
 **Low** · project-wide
+
+**Status: partly done, 2026-11-16 (branch `fix/remaining-items`).** Added this round: `output/run_summary.json` (not written on a dry run) and a printed run digest (`build_run_summary()`, `print_run_digest()`), scoring token/cost reporting (#8), the stale `find_ats.py` and `output_excel.py` docstrings corrected. Pure-function tests now exist for `_parse_json_array`/`_enforce_routing` (batch C) and `extract_slug`/`resolve_scraper`/`_clean_url` (earlier). **Still open:** the `logging` swap (touches every print), the geographic pre-filter (changes what gets scored: a policy decision), and pinning the research model's floating alias. Test: `test_run_summary_has_the_fields_a_scheduled_run_needs`.
 
 **Partial, 2026-08-24.** A `tests/` directory now exists, covering the #2
 close-pass logic: relation resolution, the `scraped_ok` guard, the 25% ratio,
@@ -934,7 +972,9 @@ regex will make the close pass retire rows that were already synced.
 ## 27. resolve_scraper reads platform names out of negative text
 **Medium** · `run.py`
 
-**Status: open, 2026-10-02.** Siemens Healthineers' ATS Platform is a long "in-house …
+**Status: done, 2026-11-16 (branch `fix/remaining-items`).** `resolve_scraper()` ignores a platform name preceded, in its clause, by a negation or example marker (not, no, like, such as, e.g., unlike, rather than ...). Siemens Healthineers' sentence now resolves to nothing. A negation in an earlier sentence does not poison a later claim. Tests: `test_negated_platform_names_resolve_to_nothing`, `test_real_platform_text_still_resolves`.
+
+**Was: open, 2026-10-02.** Siemens Healthineers' ATS Platform is a long "in-house …
 not a standard ATS like Greenhouse/Lever/Workday" sentence. `resolve_scraper()` matches
 platform names anywhere in the text, so it matches three of them, warns, and uses
 Greenhouse — a guessed-slug scrape of a company that has no Greenhouse board. It fails
@@ -945,7 +985,9 @@ marker.
 ## 28. Scrapers can still sleep on a server's Retry-After
 **High** · `http_client.py`, `scrapers/`
 
-**Status: open, 2026-10-26.** The 2026-10-26 hang (changelog; invariant 25) was
+**Status: done, 2026-11-16 (branch `fix/remaining-items`).** Flipped at the source: every session in `http_client.py` now has `respect_retry_after_header=False`, so no scraper, Notion call or scorer call can sleep on a server's value; a bounded `backoff_factor` decides. This changes retry timing for Notion and the scorer too (a rate-limited call now backs off on our schedule instead of the server's, so it may retry sooner than asked). The Teamtailor and SuccessFactors cases from #46 are covered by the same flip. Tests: `test_no_session_honours_retry_after`, `test_retry_after_header_is_ignored_when_sleeping`. `CLAUDE.md` invariant 25 updated.
+
+**Was: open, 2026-10-26.** The 2026-10-26 hang (changelog; invariant 25) was
 fixed in `detect_embedded_board()` and `html_generic` (both now on
 `http_client.third_party_session`; Sonivie's `Retry-After: 600` showed the second one
 was needed). Every other scraper still calls the shared
@@ -962,6 +1004,288 @@ the real work. Simplest fix is to flip the flag in `http_client.py` (a bounded
 and the scorer, so do it deliberately. Also confirm the `try` around each scraper call
 in `run_scrapers` covers everything that can raise.
 
+---
+
+# 2026-11-16 audit (#29-#51)
+
+Found by reading the code at commit `48d7891`; nothing was run. "Confirmed" means the
+code path was traced and any stated precondition was checked in the docs or in
+the private repo's run summary. "Plausible" means the mechanism is real but the trigger is
+unverified. **None of the fixes below changes the fingerprint or `SCORER_VERSION`, and none
+triggers a re-score.** Every fix wants an offline test beside it.
+
+## 29. A failed embedded board falls through to HTML and closes the company's rows
+**High** · `run.py:881-897` · confirmed
+
+**Status: done, 2026-11-16 (batch A, branch `fix/audit-batch-a`).** Done as specified: a board named by detection whose scraper raises is recorded `SCRAPE_FAILED` and `continue`s, so the company never enters `scraped_ok`. Test: `test_failed_embedded_board_is_failed_not_ok`. In the HTML branch of `run_scrapers()`, when
+`detect_embedded_board()` names a board and that board's scraper raises, the code
+falls through to `html_generic` on the same page. An embed or redirect page has no
+job-shaped links, so it returns `[]`, the company is stamped OK and added to
+`scraped_ok`, and the close pass closes every one of its rows. Neko Health (127 jobs,
+a redirect case) would lose all of them to one Ashby outage that outlasts the retries;
+the next run reopens them, not flagged new and with a wrong `Last Seen`.
+
+**Fix:** when detection named a board and its scraper raised, `record(row,
+SCRAPE_FAILED, ...)` and `continue`. Do not fall through. Invariant 2. Test: embedded
+scraper raises -> company not in `scraped_ok`, status Failed.
+
+## 30. SmartRecruiters postings change URL at the 100-detail cap
+**High** · `scrapers/smartrecruiters.py:36,100-116` · confirmed
+
+**Status: done, 2026-11-16 (batch B, branch `fix/audit-batch-b`).** `MAX_DETAIL_FETCHES` raised 100 -> 2000; a board over it raises `ScrapeShapeError`. A failed detail call, or a detail reply with no `postingUrl`/`applyUrl`, now raises for the whole company instead of emitting the bare-id URL; a posting with no id is skipped. Expect the one-time churn of ~26 Brainlab rows on the first run after this lands. Tests: `test_smartrecruiters_126_postings_all_use_the_detail_url`, `..._detail_failure_fails_the_company`, `..._detail_without_a_url_...`, `..._board_over_the_cap_raises`. Rippling untouched. The URL is `postingUrl` (id plus a title suffix) when
+the detail call ran and the bare-id fallback when it did not. Only the first
+`MAX_DETAIL_FETCHES` (100) postings get a detail call. Brainlab is the only
+SmartRecruiters company and has 126 postings, so 26 carry the fallback URL, and which
+26 depends on list order. A posting crossing index 100, or one transient detail
+failure, changes its URL: the old row closes and a new one is created as New This Run
+(invariant 20).
+
+**Fix:** raise the cap well above the board size, and when a detail call fails raise
+for the whole company (it lands in Failed and invariant 2 protects its rows) instead
+of emitting a second identity. Expect a one-time churn of ~26 Brainlab rows on the
+first run after the fix. The existing "keeps the posting when its detail call fails"
+style of test needs rewriting for SmartRecruiters; Rippling's URL comes from the list
+and is not affected.
+
+## 31. score_cache.json is rewritten non-atomically after every batch
+**High** · `scoring/score_jobs.py:94-97,384`, `scoring/track_new_postings.py:32-35` · confirmed
+
+**Status: done, 2026-11-16 (batch A, branch `fix/audit-batch-a`).** `_save_cache()` and `_save_seen()` write a `.tmp` beside the file, then `os.replace()`. Tests: `test_failed_cache_write_leaves_the_old_file_intact`, `test_cache_and_seen_round_trip`. `_save_cache()` rewrites the whole 11.8 MB file with a
+plain `open(..., "w")` after every batch of five. A Ctrl-C or crash mid-write leaves
+truncated JSON and `_load_cache()` then raises on every later run. A full re-score is
+~900 rewrites. The only backups are the ones `restamp_score_cache.py` makes.
+
+**Fix:** write to a temp file in the same directory, then `os.replace()`. Same for
+`_save_seen()`. Standard library only.
+
+## 32. A guessed slug is accepted as the company's board
+**High** · `ats_finder/find_ats.py:432-436`, `run.py:794,806-821` · plausible
+
+**Status: partly done, 2026-11-16 (batch C, branch `fix/audit-batch-c`).** Steps (1) and (2) landed; step (3) (checking a guessed board's own name against the company) is **still open**. (1) `find_company_info()` lets `try_known_patterns()` fill a blank or unresolved ATS but never replace a researched one. (2) In `run_scrapers()` the guessed-slug retry after a failed saved slug now happens only when the saved slug answered 404 (`_answered_404()`); a timeout, 429 or 5xx is recorded Failed. **Not changed:** the branch where no slug can be read from the saved URL still guesses one, since that has no saved slug to answer 404 and needs (3). Tests: `test_guess_does_not_overwrite_a_researched_platform`, `test_guess_may_still_fill_an_unresolved_answer`, `test_guessed_slug_is_tried_only_after_a_404`, `test_timeout_or_5xx_on_the_saved_slug_does_not_guess`. Three entry points, one failure (another company's
+postings attached, invisibly — invariant 19's failure by a different route):
+- `find_company_info()` lets `try_known_patterns()` overwrite the researched ATS
+  whenever `slugify(name)` answers 200 on Greenhouse, Lever or Ashby. That proves a
+  board with that slug exists, not that it is this company's.
+- `run_scrapers()` guesses a slug when none can be read from the saved URL.
+- When a saved slug fails for ANY reason, including a timeout, the guessed slug is
+  tried and a success enters `scraped_ok`.
+
+**Fix:** (1) never let a guess override a researched platform; (2) fall back to a
+guessed slug only when the saved slug answered 404, not on a timeout or 5xx;
+(3) ideally check the board's own name against the company before accepting a guess.
+(3) may need design — do (1) and (2) first. Related: #27.
+
+## 33. A failed score overwrites Routing, Reasoning and IC Role
+**Medium** · `scoring/score_jobs.py:401-409`, `notion/client.py:548-574` · confirmed
+
+**Status: done, 2026-11-16 (batch A, branch `fix/audit-batch-a`).** `_changed_job_properties()` skips every scorer-owned field (Score, Routing, Reasoning, Ambiguity Note, IC Role) when the job's score is `None`; `_failure_result()` is unchanged. Test uses the real failure shape: `test_real_failure_shape_writes_nothing`. Invariant 15's wording in `CLAUDE.md` corrected. Invariant 15 says a failed job comes back with `score`
+and `routing` of `None`. `_failure_result()` actually returns routing `"Needs
+review"`, a "Scoring failed: ..." reasoning, an ambiguity note and `ic_role_flag`
+False. The diff skips only Score, so an existing good row keeps its score but is
+moved to Needs Review and loses its Reasoning until the next successful run. Most
+likely during a full re-score with rate-limited batches.
+`tests/test_delta_sync.py:365-372` passes `routing=None`, a shape the scorer never
+produces.
+
+**Fix:** in `_changed_job_properties()`, when the job's `score` is `None`, skip every
+scorer-owned field (Routing, Reasoning, Ambiguity Note, IC Role). Do NOT change
+`_failure_result()`'s literals — `output_excel.py` reads them. Rewrite the test with
+the real failure shape, and correct invariant 15's wording in `CLAUDE.md`.
+
+## 34. Row creation is transparently retried and can duplicate
+**Medium** · `http_client.py:21-27`, `notion/client.py:1327` · plausible
+
+**Status: done, 2026-11-16 (batch B, branch `fix/audit-batch-b`).** New `http_client.create_session` (retries only 429 and connect errors, `read=0`) used by `_create_job_posting()` only; `respect_retry_after_header` left as the patient session has it, for #28 to decide. Tests: `test_create_session_retries_only_429_and_connect_errors`, `test_create_job_posting_posts_through_create_session`. The shared session retries POST on 502/504 and on read
+timeouts. If Notion committed the page before the gateway error, urllib3 re-sends the
+create and a second row exists for the same URL — which invariant 20 says no later
+run can reach.
+
+**Fix:** send `_create_job_posting()` through a session that retries only 429 and
+connect errors (keep `respect_retry_after_header` as #28 decides). A create that
+fails is already reconciled by URL on the next run.
+
+## 35. scraped_ok and the Company relation are keyed by name
+**Medium** · `run.py:735`, `notion/client.py:712,875` · confirmed precondition
+
+**Status: done, 2026-11-16 (batch B, branch `fix/audit-batch-b`).** `prepare_jobs()` stamps `company_page_id` on each job; `scraped_ok` is a set of page ids; the sync takes the relation from the job's own id (name lookup only as a fallback for a job with no id); the close pass tests `row["company_page_id"] in scraped_ok`. `test_close_pass.py`, `test_delta_sync.py`, `test_large_medtech_filter.py` and `test_url_based_plumbing.py` updated to page ids. Tests: `test_failed_twin_is_not_closed_by_its_successful_namesake`, `test_job_relation_uses_the_jobs_own_page_id`, `test_scraped_ok_holds_page_ids`, `test_prepare_jobs_stamps_the_page_id`. `docs/project-status.md` records two company names
+that each appear twice (Neuvotion, NeuroOne Medical Technologies). `scraped_ok` is a
+set of names and `company_page_by_name` keeps one page per name. If one row fails and
+its twin scrapes OK with zero jobs, the name is in `scraped_ok` and the failed row's
+postings close (invariant 2).
+
+**Fix:** stamp `company_page_id` on each job in `prepare_jobs()`, make `scraped_ok` a
+set of page ids, and have the sync use the job's page id for the relation and the
+close pass compare `row["company_page_id"]`. Tests in `test_close_pass.py` and
+`test_delta_sync.py` pass names today and need updating.
+
+## 36. Five scrapers read a missing key as an empty board
+**Medium** · `scrapers/greenhouse.py:12`, `ashby.py:22`, `workable.py:85`, `pinpoint.py:65`, `teamtailor.py:59` · plausible
+
+**Status: done, 2026-11-16 (batch A, branch `fix/audit-batch-a`).** New `scrapers.common.require_list()` raises `ScrapeShapeError` on a missing key or non-list; used by Greenhouse, Ashby, Workable, Pinpoint and Teamtailor. An empty list under the key is still a real empty board. Tests parametrised over all five. The `html_generic` and per-company-guard follow-ups were not touched. `.get("jobs", [])` (and `"data"`, `"items"`) returns
+`[]` for a 200 reply that lacks the key (invariant 23). The 25% valve cannot see a
+single-platform false zero: all 1,227 Greenhouse rows are under it. Related and NOT
+part of this fix: `html_generic` returns `[]` for any page with no job-shaped links,
+so a JS redesign silently closes a company and stamps it OK.
+
+**Fix:** raise `scrapers.common.ScrapeShapeError` when the key is absent; an empty
+list under the key stays a real empty board. Optional follow-up worth its own
+decision: a per-company guard that holds a "had open rows, now zero" result for one
+run and says so in the Scrape Note.
+
+## 37. Oracle and SuccessFactors always scrape senior terms only
+**Medium** · `scrapers/oracle_rc.py:101`, `scrapers/successfactors.py:102`, `run.py:756` · confirmed
+
+**Status: done, 2026-11-16 (batch C, branch `fix/audit-batch-c`).** `run.py` passes `SENIOR_SEARCH_TERMS` to Oracle and SuccessFactors for a tiered company and the new `ALL_POSTINGS_TERMS` (`[""]`, an empty keyword) otherwise. Both scrapers also now raise `ScrapeShapeError` when a board still has postings after `MAX_PAGES` pages, because a full-board read can exceed the cap and a silently truncated read would make every later posting look gone to the close pass. **Unverified live:** that an empty `keyword=` returns the whole board on Oracle; the SuccessFactors empty `q=` is likewise untested against a real site. Check with `--dry-run` on the first untiered company on either platform. Tests: `test_untiered_company_reads_the_whole_board`, `test_tiered_company_keeps_the_senior_terms`, `test_empty_keyword_is_sent_as_an_empty_query`, `test_a_board_longer_than_max_pages_raises_instead_of_truncating`. Both default `search_terms` to `SENIOR_SEARCH_TERMS`
+and `run.py` never passes any, so an untiered company on either platform silently
+loses every non-senior posting — against invariant 22's "every other company keeps
+every posting". Harmless only while every such company is tiered.
+
+**Fix:** pass terms by tier as the Workday branch does (`run.py:731`), and page the
+full board (empty keyword) when the company is untiered.
+
+## 38. An interrupted sync loses New This Run on rows it created
+**Medium** · `notion/client.py:811`, `run.py:989-1002` · confirmed
+
+**Status: done, 2026-11-16 (batch B, branch `fix/audit-batch-b`).** `sync_jobs_to_notion()` rewrites `output/carry_new_this_run.json` (atomically, carried ids included) after each real create and deletes it when the sync runs to the end; `run.py` no longer removes it itself and reads the path from `notion.client.CARRY_NEW_PATH`. `tests/conftest.py` gained an autouse fixture pointing that path at a temp dir, so no test touches the real file. Tests: `test_interrupted_sync_leaves_the_created_ids_behind`, `test_completed_sync_deletes_the_carry_file`, `test_dry_run_writes_no_carry_file`, `test_carried_ids_from_an_earlier_run_are_kept_...`. A run killed mid-sync has already created some rows.
+The next run reads them as existing and clears the flag, so they are never shown as
+new. `output/carry_new_this_run.json` exists for exactly this but nothing writes it.
+
+**Fix:** have the sync append each created page id to that file as it goes (real
+runs only — thread `dry_run`) and delete it when the sync completes. `run.py`
+already reads and removes it. Tests must point the path at a temp dir.
+
+## 39. Scorer output is not validated before use
+**Medium** · `scoring/score_jobs.py:391,422-432` · plausible
+
+**Status: done, 2026-11-16 (batch C, branch `fix/audit-batch-c`).** `_parse_json_array()` raises `_BatchParseError` unless the indices are exactly `0..n-1`; each element is reduced to the six result keys; `score` is coerced (int, integral float or digit string) and anything outside 0-5, or a bool, makes that one posting a failure result (score `None`, retried next run) rather than failing the batch. `score_all()` copies onto a job only the result keys plus `rubric_fp`/`rubric_hash`/`previous`. No prompt, model or fingerprint change. First tests for the module: `test_duplicate_or_missing_indices_fail_the_batch`, `test_extra_keys_are_dropped_from_a_result`, `test_scores_are_coerced_and_range_checked`, `test_invalid_score_makes_that_posting_a_failure_...`, `test_a_cached_result_cannot_overwrite_the_jobs_identity`. Three gaps:
+- `_parse_json_array()` checks the count but not that the indices are exactly
+  `0..n-1`, so a duplicated index assigns a score to the wrong job.
+- `job.update(result)` copies every key the model returned, so an echoed `url` or
+  `title` would overwrite the job's identity.
+- A string score such as `"0"` routes as Scored and fails the Notion write every run.
+
+**Fix:** raise `_BatchParseError` unless indices are exactly `0..n-1`; copy only
+`score`, `reasoning`, `ambiguous`, `ambiguity_note`, `ic_role_flag`, `routing` (plus
+the provenance keys); coerce `score` to int and treat anything outside 0-5 as a
+failure. None of this changes the prompt, so no fingerprint change. The module has no
+tests at all today — add them here.
+
+## 41. rubric.md is read with the Windows default encoding
+**Medium** · `scoring/score_jobs.py:47,51` · confirmed
+
+**Status: done, 2026-11-16 (batch A, branch `fix/audit-batch-a`).** `encoding="utf-8"` on both opens in `scoring/score_jobs.py` (the rubric and, for the same reason, the keywords file). Test: `test_rubric_is_decoded_as_utf8`. `open(_RUBRIC_PATH)` has no `encoding=`. This machine
+is cp1252 with UTF-8 mode off, and the rubric has em-dashes on lines 25 and 29, so
+the model receives `â€”` there. A curly closing quote pasted into the rubric would
+raise `UnicodeDecodeError` at import and stop the run before it starts.
+
+**Fix:** `encoding="utf-8"` on both opens. It changes `rubric_hash` going forward
+(provenance only, never compared) and invalidates nothing.
+
+## 42. Scrape Note comparison can never be equal for connection errors
+**Low** · `notion/client.py:393-395,425` · plausible
+
+**Status: done, 2026-11-16 (batch C, branch `fix/audit-batch-c`).** `_normalise_scrape_note()` strips `object at 0x...` and truncates to 2,000; it is applied to the new note, the stored note being compared, and the write. Notes already stored with an address will differ once, then settle. Tests: `test_connection_error_note_is_not_rewritten_every_run`, `test_over_long_note_is_not_rewritten_every_run`, `test_object_address_is_stripped_and_long_notes_truncated`. Invariant 13's trap in `sync_scrape_status()`.
+Connection-error text contains `object at 0x...`, which differs every run, so a
+DNS-dead company's note is rewritten every run. A note over 2,000 characters is
+written truncated but compared untruncated.
+
+**Fix:** strip `object at 0x[0-9A-Fa-f]+` from the note and truncate to 2,000 before
+both the comparison and the write.
+
+## 43. Personio host fallback changes URL identity
+**Low** · `scrapers/personio.py:83-120` · plausible
+
+**Status: done, 2026-11-16 (batch B, branch `fix/audit-batch-b`).** `.de` is tried only after a definite no-such-board answer on `.com`: the 307 redirect, **or a 404** (a small widening of the item's wording, so the existing `test_personio_falls_back_to_the_de_host` stays valid). Timeouts, 5xx and bad XML propagate. Tests: `test_personio_timeout_on_com_does_not_fall_to_de`, `..._5xx_...`, `test_personio_redirect_on_com_still_falls_to_de`. Any failure on `.com`, including a timeout, falls to
+`.de`. For a tenant that answers on both, every posting URL changes host, so the
+company's rows all close and re-create.
+
+**Fix:** fall to `.de` only when `.com` gave the redirect ("no such board") answer;
+re-raise anything else.
+
+## 44. Scheme-less URLs from research loop or blank-stamp
+**Low** · `ats_finder/find_ats.py:346-348`, `ats_finder/find_website.py:153-154,177` · plausible
+
+**Status: done, 2026-11-16 (batch C, branch `fix/audit-batch-c`).** New `ats_finder.careers_url.ensure_scheme()` (a dot, no whitespace, no scheme: nothing else is touched) used in `_clean_url()` and `find_website_homepage()`. Tests: `test_ensure_scheme_is_narrow`, `test_research_reply_with_a_scheme_less_url_is_saved_with_one`, `test_scheme_less_homepage_answer_yields_a_host`. `_clean_url()` returns the raw text when it finds no
+`http(s)://` token, so `example.com/careers` is saved, fails
+`is_usable_careers_url()`, and is re-researched (paid) every run. In
+`find_website_homepage()` a scheme-less answer yields no host, and the company gets
+the permanent blank icon (invariant 16) despite a real answer.
+
+**Fix:** when the value has a dot and no scheme, prepend `https://` in both places.
+
+## 45. HTML scraper mojibake and unjoined relative links
+**Low** · `scrapers/html_generic.py:226,268-271`, `ats_finder/find_embedded_board.py:165` · confirmed / plausible
+
+**Status: done, 2026-11-16 (batch C, branch `fix/audit-batch-c`).** New `http_client.response_text()` sets the detected encoding when the response declares no charset; used by `html_generic.fetch_jobs()` and `find_embedded_board.py`. Every href goes through `urljoin`; fragment-only, `javascript:`, `mailto:` and `tel:` hrefs are no link and fall back to the careers URL as a missing href always did. Expect one-time title and URL churn on HTML companies. Tests: `test_undeclared_charset_uses_the_detected_one`, `test_declared_charset_is_trusted`, `test_hrefs_are_joined_and_non_links_dropped`, `test_generic_scrape_uses_joined_links_and_falls_back_for_non_links`. `resp.text` decodes as ISO-8859-1 when the server
+sends no charset; the private repo's run summary shows it in a real title ("PA Â· Full-time",
+confirmed). Only hrefs starting with `/` are joined to the page URL, so `#`,
+`javascript:` and bare relative links are stored as-is and can collide across
+companies in `dedupe_jobs_by_url()` (plausible).
+
+**Fix:** set `resp.encoding = resp.apparent_encoding` when the response declares no
+charset, in both files. `urljoin` every href; treat fragment-only, `javascript:` and
+`mailto:` hrefs as no link. Titles will change once (one write each); URLs for
+relative links will change identity once. Overlaps #5.
+
+## 46. sniff_ats_from_page honours Retry-After on third-party sites
+**Low** · `ats_finder/find_ats.py:37-43,139` · confirmed
+
+**Status: done, 2026-11-16 (batch C, branch `fix/audit-batch-c`).** `sniff_ats_from_page()` fetches through `third_party_session`. `try_known_patterns()` keeps `_guess_session` on purpose. The Teamtailor and SuccessFactors cases were **not** touched: they are folded into #28 as the item says. Test: `test_sniff_fetches_through_the_third_party_session`. It fetches arbitrary company careers pages on
+`_guess_session`, which has `respect_retry_after_header=True` (invariant 25).
+Teamtailor and SuccessFactors also hit company-owned domains on the patient session.
+
+**Fix:** use `http_client.third_party_session` for the sniff. Fold the Teamtailor and
+SuccessFactors cases into #28.
+
+## 47. Hardcoded Job Postings fallback id looks stale
+**Low** · `notion/client.py:27` · plausible
+
+**Status: done, 2026-11-16 (batch A, branch `fix/audit-batch-a`).** Fallback removed: `os.environ["JOB_POSTINGS_DATABASE_ID"]`. Mirror section of `CLAUDE.md` updated (one scrub fewer). Test: `test_job_postings_id_has_no_fallback`. The fallback differs from the Job Postings id recorded
+in `docs/project-status.md` after the September workspace move. With the env var
+missing, the sync would target the old database.
+
+**Fix:** `os.environ["JOB_POSTINGS_DATABASE_ID"]`, no fallback, as the public mirror
+already does. Update the mirror section of `CLAUDE.md` (one scrub fewer).
+
+## 48. A blank-named Companies row costs a paid search every run
+**Low** · `notion/client.py:164-166`, `ats_finder/find_ats.py:49-50` · plausible
+
+**Status: done, 2026-11-16 (batch A, branch `fix/audit-batch-a`).** `_drop_unnamed()` applied to the four `get_companies_missing_*` selectors and a skip at the top of `run_scrapers()`, each printing how many were skipped. Tests: `test_selectors_skip_unnamed_rows`, `test_run_scrapers_skips_unnamed_rows`. `test_website_backfill.py`'s fixture rows gained a `company` name. An empty row has company `None` and a blank ATS, so
+`fill_missing_ats()` researches "None" (billed), then `slugify(None)` raises, which
+is logged as "will retry next run".
+
+**Fix:** skip rows with no company name in the `get_companies_missing_*` selectors
+and in `run_scrapers()`, and print how many were skipped.
+
+## 49. Senior search terms lack "vp" and "svp"
+**Low** · `scrapers/common.py:27`, `run.py:125-128` · plausible
+
+**Status: done, 2026-11-16 (batch C, branch `fix/audit-batch-c`).** `"vp"` and `"svp"` added to `SENIOR_SEARCH_TERMS`. Test: `test_senior_terms_include_vp_and_svp`. Newly found postings are new rows and will be scored. `SENIOR_TITLE_RE` accepts `vp` and `svp` but the search
+terms do not include them, so abbreviated titles at tiered companies are found only
+when another term happens to match.
+
+**Fix:** add both terms. More requests per tiered company; newly found postings are
+new rows and will be scored.
+
+## 50. Unanimity is not ownership in board detection
+**Low** · `ats_finder/find_embedded_board.py:226-235` · plausible · **decision**
+
+**Status: left as is, 2026-11-16 (the owner's decision).** Tier 3 accepts a page that links exactly one board. A
+VC firm's page linking one portfolio company's board passes, and that board is
+scraped as the firm's own. The Scrape Note says so, but under status OK, which no
+view surfaces. Options: require the slug to resemble the company name for tier 3
+only, or leave it. No fix proposed.
+
+## 51. --dry-run overwrites jobs.json and the workbook
+**Low** · `run.py:1028-1044` · confirmed
+
+**Status: left as is, 2026-11-16 (the owner's decision).** A dry run rewrites `output/jobs.json`,
+`skipped_companies.json` and `job_postings.xlsx` with rehearsal data. It breaks no
+stated guarantee, but the local artifacts then describe a run that never synced.
+
+**Fix:** under `dry_run`, skip the three writes or write them beside the real ones
+with a `.dry-run` suffix.
+
 ## Suggested batching
 
 One branch and one PR per batch. This order is not the priority order.
@@ -976,3 +1300,15 @@ One branch and one PR per batch. This order is not the priority order.
 
 Batch 1 will trigger a full re-score. Back up `output/score_cache.json` first and
 budget for it.
+
+### 2026-11-16 audit batches (#29-#51)
+
+None of these triggers a re-score. After each batch: `python -m pytest tests/`, then
+`python run.py --dry-run` and read the planned writes, and only then a real run.
+
+| Batch | Items | Why together |
+|---|---|---|
+| A | **#29, #31, #33, #36, #41, #47, #48** | Stop data loss. All small, independent, a few lines plus a test each. |
+| B | **#30, #35, #34, #38, #43** | Row identity. #35 touches the tests the others build on, so do it first. Expect ~26 Brainlab rows to churn once after #30. |
+| C | **#32, #37, #39, #42, #44, #45, #46, #49** | The rest. #32 step (3) may need design; land steps (1) and (2) regardless. |
+| — | **#50, #51** | Left as is by the owner's decision, 2026-11-16. Not in any batch; do not implement. |

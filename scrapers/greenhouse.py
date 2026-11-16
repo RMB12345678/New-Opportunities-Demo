@@ -1,5 +1,6 @@
 """Pulls open job postings from a Greenhouse job board."""
 from http_client import session
+from scrapers.common import require_list
 
 from ats_finder.find_ats import slugify
 
@@ -9,7 +10,7 @@ def fetch_jobs(company_name, slug=None):
     url = f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true"
     resp = session.get(url, timeout=10)
     resp.raise_for_status()
-    jobs = resp.json().get("jobs", [])
+    jobs = require_list(resp.json(), "jobs", "Greenhouse")
 
     return [
         {

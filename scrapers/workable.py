@@ -40,6 +40,7 @@ their stale rows correctly. A *wrong* slug 404s, which raise_for_status
 turns into the failure it is.
 """
 from http_client import session
+from scrapers.common import require_list
 
 from ats_finder.find_ats import slugify
 
@@ -82,7 +83,7 @@ def fetch_jobs(company_name, slug=None):
     url = f"https://apply.workable.com/api/v1/widget/accounts/{slug}?details=true"
     resp = session.get(url, timeout=15)
     resp.raise_for_status()
-    jobs = resp.json().get("jobs", [])
+    jobs = require_list(resp.json(), "jobs", "Workable")
 
     # Collapse the per-city repeats described above, keyed on the apply
     # URL because that is the identity the rest of the pipeline uses. A

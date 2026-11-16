@@ -50,7 +50,7 @@ from urllib.parse import urlparse, unquote
 
 from bs4 import BeautifulSoup
 
-from http_client import third_party_session as session
+from http_client import third_party_session as session, response_text
 
 # Some careers pages return a stub or a 403 to a bare programmatic request.
 # The pages are public; this just looks like a browser so they answer
@@ -162,7 +162,7 @@ def detect_embedded_board(careers_url, slug_patterns, timeout=20):
     try:
         resp = session.get(careers_url, headers=HEADERS, timeout=timeout)
         resp.raise_for_status()
-        html = resp.text
+        html = response_text(resp)
         final_url = resp.url
     except Exception as e:
         return None, None, f"could not fetch the careers page ({e})", None

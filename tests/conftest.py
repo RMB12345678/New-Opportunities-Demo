@@ -27,3 +27,15 @@ os.environ.setdefault("NOTION_API_KEY", "test-key-not-real")
 os.environ.setdefault("NOTION_DATABASE_ID", "test-target-list-db")
 os.environ.setdefault("JOB_POSTINGS_DATABASE_ID", "test-job-postings-db")
 os.environ.setdefault("ANTHROPIC_API_KEY", "test-key-not-real")
+
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolate_carry_file(tmp_path, monkeypatch):
+    """sync_jobs_to_notion() writes output/carry_new_this_run.json as it
+    creates rows. Point it at a temp dir for every test so no test run can
+    leave (or delete) the real hand-off file."""
+    import notion.client as nc
+    monkeypatch.setattr(nc, "CARRY_NEW_PATH", str(tmp_path / "carry_new_this_run.json"))

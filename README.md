@@ -29,7 +29,7 @@ Against the private database this is a copy of:
   That run handled 5,309 postings across 306 companies with open roles. A
   steady-state run writes roughly a hundred rows to Notion rather than
   all of them.
-- **13 ATS platforms** read through their public endpoints, and **220
+- **13 ATS platforms** read through their public endpoints, and **300
   offline tests**.
 
 ## What it does
@@ -47,13 +47,16 @@ Against the private database this is a copy of:
    only *looks* in-house is checked first for an ATS board it embeds,
    redirects to or links — but only when the page names exactly one, so a
    careers page listing a portfolio of other companies' boards is refused
-   rather than guessed at. Companies in the large-company tiers (Large MedTech, over $1B
+   rather than guessed at. A scrape that fails, or whose reply is not the shape
+   the scraper understands, marks the company Failed rather than reading as an
+   empty board, so a failure never closes its postings. Companies in the large-company tiers (Large MedTech, over $1B
    revenue, plus Large Biotech and Large Misc) are scraped in full but only their senior titles (VP, director,
    head of, general manager, chief) are kept, scored and synced, so they
    cannot flood the list.
 3. **Scores every posting** against a rubric (`scoring/rubric.md`) using
    Claude — the posting's own text, not just its title — batched and
-   cached to keep API costs low. The cache is fingerprinted against the
+   cached to keep API costs low, with the tokens spent, an estimated cost and
+   whether prompt caching is firing printed every run. The cache is fingerprinted against the
    model, the keyword list and a scorer version, so changing any of those
    re-scores everything instead of serving stale answers. Editing the rubric
    itself applies going forward: only newly scored postings see the new
@@ -79,7 +82,7 @@ flowchart TD
     S3["Backfill missing Careers URL\nIf ATS already confirmed: search targets\nTHAT platform's URL pattern specifically\nFallback chain: dedicated page -> homepage -> Google search"] --> S4
 
     S4{"Scrape\nATS Platform?"}
-    S4 -->|One of thirteen API-backed platforms| S4a["Hit real public API\nUse CONFIRMED slug from saved URL first,\nfall back to guessing from company name"]
+    S4 -->|One of thirteen API-backed platforms| S4a["Hit real public API\nUse CONFIRMED slug from saved URL first;\nguess from the company name only if that\nslug answered 404, never on a timeout"]
     S4 -->|HTML / in-house page| S4b["Look for an embedded ATS board first\n(redirect, embed or link — and only if the\npage names exactly one board)\nelse generic scraper: job-title-like link\ntext, filters nav/footer noise"]
     S4 -->|No ATS found / Ambiguous| S4c["Skipped -> Needs Manual Check"]
 
@@ -146,9 +149,25 @@ flowchart TD
   nothing* — errors retry next run instead of writing a false negative.
 - **Resilient sync**: all HTTP goes through one shared session
   (`http_client.py`) that retries with growing backoff on 429s and 5xxs
-  only, respecting `Retry-After`. One failed write no longer takes down a
-  run. Speculative ATS slug guesses deliberately use a separate
+  only, and never sleeping on a server's `Retry-After` (a huge value
+  once froze a run for hours despite every timeout being set). Creating a
+  Notion row goes through a stricter session that retries only a 429 or a
+  failed connection, so a row whose create timed out is never sent twice.
+  One failed write no longer takes down a run. Speculative ATS slug guesses deliberately use a separate
   fail-fast session, where retrying a wrong guess just wastes time.
+- **An error, or a page it cannot read, is not an empty board**: scrapers
+  raise when a reply lacks the shape they expect, and a board named by a
+  careers page whose scrape then fails is recorded as failed instead of
+  falling through to the generic HTML scraper, which would read it as zero
+  jobs and let the close pass retire every posting the company has.
+- **Identity is the page id, not the name**: two Companies rows can share a
+  name, so "scraped successfully" and each posting's company relation are
+  keyed by the row's id. One twin failing can no longer be vouched for by
+  the other scraping an empty board.
+- **State files survive a crash**: the score cache and run history are
+  written to a temporary file and swapped in, and rows a sync creates are
+  recorded as it goes, so an interrupted run loses neither the cache nor
+  the "new" flag on what it had already added.
 - **Free pre-filtering**: job titles matching an excluded-keyword list
   get an instant "Non-fit" with zero API cost, before ever reaching the
   scoring step.
@@ -184,8 +203,9 @@ mode.
 A fresh clone has an empty `output/` holding only a `.gitkeep`, and that is
 the intended state — nothing is missing. Everything the pipeline writes lands
 there and none of it is committed: `jobs.json` and `skipped_companies.json`
-from the scrape, `score_cache.json` (the scores already paid for),
-`seen_jobs.json` (run history), and the generated `.xlsx` workbook. The
+from the scrape, `run_summary.json` (a structured record of each real run),
+`score_cache.json` (the scores already paid for), `seen_jobs.json` (run
+history), and the generated `.xlsx` workbook. The
 directory fills itself on your first run.
 
 That also means `python output_excel.py` has nothing to rebuild from until
@@ -253,7 +273,7 @@ detected automatically.
 python -m pytest tests/
 ```
 
-The suite (220 tests) is offline — no network, no API keys, no Notion, and it stubs
+The suite (300 tests) is offline — no network, no API keys, no Notion, and it stubs
 the on-disk run state so a test run can never advance it. It covers the
 close-pass rules that decide whether a posting is retired (company-relation
 resolution, the scraped-successfully guard, the 25% ratio valve, its 20-row
@@ -261,7 +281,7 @@ floor, the empty-database case), the delta sync and the comparison traps
 that would otherwise rewrite every row on every run, the one-row-per-URL
 rule and the "New This Run" reset, each ATS scraper's slug extraction and
 job-dict contract (including the URL-based Oracle and SuccessFactors scrapers
-and their refusal to report a false empty board), the senior-title filter for the large-company tiers, embedded-board detection and its refusal to guess when a
+and their refusal to report a false empty board), the scraper shape checks, the generic HTML scraper's link handling, the scorer's validation of the model's reply, the senior-title filter for the large-company tiers, embedded-board detection and its refusal to guess when a
 page names several boards, and the checks that tell a never-researched field
 apart from one holding a wrong value.
 

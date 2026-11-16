@@ -44,11 +44,11 @@ BATCH_SIZE = 5
 CACHE_PATH = os.path.join(os.path.dirname(__file__), "..", "output", "score_cache.json")
 
 _EXCLUDED_KEYWORDS_PATH = os.path.join(os.path.dirname(__file__), "excluded_title_keywords.json")
-with open(_EXCLUDED_KEYWORDS_PATH) as f:
+with open(_EXCLUDED_KEYWORDS_PATH, encoding="utf-8") as f:
     EXCLUDED_TITLE_KEYWORDS = json.load(f)
 
 _RUBRIC_PATH = os.path.join(os.path.dirname(__file__), "rubric.md")
-with open(_RUBRIC_PATH) as f:
+with open(_RUBRIC_PATH, encoding="utf-8") as f:
     RUBRIC_TEXT = f.read()
 
 # Bump whenever the prompt or listing shape changes in a way that could
@@ -84,6 +84,55 @@ SAME ORDER, in exactly this shape:
 }}"""
 
 
+# What this process has spent on scoring, summed from each response's `usage`
+# block. Nothing read it before, so there was no way to tell whether the
+# `cache_control` marker was doing anything: if cache_creation_input_tokens and
+# cache_read_input_tokens are both always 0, the system prompt is below the
+# model's minimum cacheable prefix and the marker is being ignored (punch list
+# #8). Reporting only - no prompt, model or fingerprint input changes here.
+USAGE = {"calls": 0, "input_tokens": 0, "output_tokens": 0,
+         "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
+
+# USD per million tokens for MODEL. An ESTIMATE for the run digest, not a
+# bill: check them against current pricing if the model changes. Cache writes
+# cost 1.25x input and cache reads 0.1x.
+PRICE_PER_MTOK = {"input": 1.00, "output": 5.00}
+
+
+def _record_usage(data):
+    usage = (data or {}).get("usage") or {}
+    USAGE["calls"] += 1
+    for key in ("input_tokens", "output_tokens",
+                "cache_creation_input_tokens", "cache_read_input_tokens"):
+        value = usage.get(key)
+        if isinstance(value, int):
+            USAGE[key] += value
+
+
+def estimated_cost_usd(usage=None):
+    u = usage or USAGE
+    return (u["input_tokens"] * PRICE_PER_MTOK["input"]
+            + u["cache_creation_input_tokens"] * PRICE_PER_MTOK["input"] * 1.25
+            + u["cache_read_input_tokens"] * PRICE_PER_MTOK["input"] * 0.10
+            + u["output_tokens"] * PRICE_PER_MTOK["output"]) / 1_000_000
+
+
+def usage_report():
+    """One printable block of the scoring spend, and whether caching fired."""
+    u = USAGE
+    if not u["calls"]:
+        return "[score] no Anthropic scoring calls this run"
+    caching = ("prompt caching IS firing" if u["cache_read_input_tokens"]
+               else "no cache reads - the system prompt may be under the minimum "
+                    "cacheable size, so the cache_control marker is being ignored"
+               if u["cache_creation_input_tokens"] == 0 else
+               "cache written but never read this run")
+    return (f"[score] {u['calls']} call(s): {u['input_tokens']} input, "
+            f"{u['output_tokens']} output, {u['cache_creation_input_tokens']} cache-write, "
+            f"{u['cache_read_input_tokens']} cache-read tokens "
+            f"(~${estimated_cost_usd():.2f}); {caching}")
+
+
 def _load_cache():
     if os.path.exists(CACHE_PATH):
         with open(CACHE_PATH) as f:
@@ -93,8 +142,13 @@ def _load_cache():
 
 def _save_cache(cache):
     os.makedirs(os.path.dirname(CACHE_PATH), exist_ok=True)
-    with open(CACHE_PATH, "w") as f:
+    # Temp file in the same directory, then os.replace(): a crash or Ctrl-C
+    # mid-write leaves the old file intact instead of truncated JSON that
+    # _load_cache() would raise on forever.
+    tmp = CACHE_PATH + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(cache, f, indent=2)
+    os.replace(tmp, CACHE_PATH)
 
 
 def _job_key(job):
@@ -219,6 +273,7 @@ def _score_batch(batch):
         raise RuntimeError(f"{resp.status_code} error from Anthropic API: {detail}")
 
     data = resp.json()
+    _record_usage(data)
 
     text = "".join(
         block["text"] for block in data.get("content", []) if block.get("type") == "text"
@@ -383,14 +438,17 @@ def score_all(jobs, dry_run=False):
                 _write_cache_entry(cache, _job_key(job), result)
             _save_cache(cache)  # save after every batch, not just at the end
 
+    print(usage_report())
+
     scored = []
     for job in jobs:
         result = cache.get(_job_key(job))
         job = dict(job)
         if result is not None:
-            job.update({k: v for k, v in result.items() if k != "index"})
+            job.update({k: v for k, v in result.items() if k in _JOB_UPDATE_KEYS})
         elif not dry_run:
-            job.update({k: v for k, v in _failure_result("not found in cache").items() if k != "index"})
+            job.update({k: v for k, v in _failure_result("not found in cache").items()
+                        if k in _JOB_UPDATE_KEYS})
         # dry_run with no cached result: leave the job without score fields —
         # claiming "Scoring failed" here would misrepresent a deliberate skip
         # as a real failure that never happened.
@@ -419,15 +477,63 @@ class _BatchParseError(Exception):
     pass
 
 
+# The only keys a scorer result may carry onto a job. The model's reply is
+# data, not a trusted record: copying every key it returned meant an echoed
+# `url` or `title` would overwrite the job's identity. The second group is
+# provenance _write_cache_entry() adds, which cached entries legitimately hold.
+_RESULT_KEYS = ("score", "reasoning", "ambiguous", "ambiguity_note",
+                "ic_role_flag", "routing")
+_PROVENANCE_KEYS = ("rubric_fp", "rubric_hash", "previous")
+_JOB_UPDATE_KEYS = _RESULT_KEYS + _PROVENANCE_KEYS
+
+
+def _coerce_score(value):
+    """An int 0-5, or None when the value is not one. Accepts an integral
+    float or a digit string ("3") because models do emit those, and rejects
+    everything else - notably bool, which is an int to Python but not a
+    score, and a string such as "0" that would route as Scored and then fail
+    the Notion number write on every run."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    elif isinstance(value, str) and value.strip().isdigit():
+        value = int(value.strip())
+    if isinstance(value, int) and 0 <= value <= 5:
+        return value
+    return None
+
+
+def _clean_result(raw):
+    """Reduce one element of the model's array to the keys a result may
+    carry, with the score validated. An unusable score makes THAT posting a
+    failure (retried next run, like any other) rather than a wrong answer."""
+    score = _coerce_score(raw.get("score"))
+    if score is None:
+        failed = _failure_result(f"model returned an invalid score {raw.get('score')!r}")
+        failed["index"] = raw["index"]
+        return failed
+    clean = {k: raw[k] for k in _RESULT_KEYS if k in raw}
+    clean["score"] = score
+    clean["index"] = raw["index"]
+    return clean
+
+
 def _parse_json_array(text, expected):
     cleaned = re.sub(r"^```json\s*|\s*```$", "", text.strip())
     try:
         parsed = json.loads(cleaned)
         if isinstance(parsed, list) and len(parsed) == expected:
-            return sorted(parsed, key=lambda r: r.get("index", 0))
+            # The indices must be EXACTLY 0..n-1. A count match alone lets a
+            # duplicated index (two [1]s, no [2]) through, and the sort below
+            # then hands one posting's score to another.
+            indices = [r.get("index") if isinstance(r, dict) else None for r in parsed]
+            if (all(isinstance(i, int) and not isinstance(i, bool) for i in indices)
+                    and sorted(indices) == list(range(expected))):
+                return [_clean_result(r) for r in sorted(parsed, key=lambda r: r["index"])]
     except json.JSONDecodeError:
         pass
-    # Parsing failed or count mismatch — fail the whole batch safely rather
-    # than risk misaligning results to the wrong jobs.
+    # Parsing failed, count or index mismatch — fail the whole batch safely
+    # rather than risk misaligning results to the wrong jobs.
     raise _BatchParseError(f"could not parse batch response: {text[:150]}")
 

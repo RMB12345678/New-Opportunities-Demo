@@ -116,4 +116,11 @@ def fetch_jobs(company_name, careers_url, search_terms=None):
             polite_sleep()
             if not reqs or offset >= total:
                 break
+        else:
+            # Ran out of pages with postings still left. Returning what was
+            # read would make every later posting look gone to the close pass.
+            raise ScrapeShapeError(
+                f"{company_name}: Oracle board still had postings after {MAX_PAGES} "
+                f"pages for keyword {term!r}; refusing to treat a truncated read as "
+                f"the whole board")
     return dedupe_by_url(jobs)

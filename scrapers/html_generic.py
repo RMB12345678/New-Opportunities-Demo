@@ -106,10 +106,11 @@ JOB_TITLE_HINTS or MAX_TITLE_LENGTH back down (that would re-break INBRAIN):
     company-news post lives at, and a shape a real job listing does not.
 """
 import re
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
 
-from http_client import third_party_session as session
+from http_client import third_party_session as session, response_text
+from scrapers.common import ScrapeShapeError
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; MedTechTargetScraper/1.0)"}
 
@@ -185,6 +186,25 @@ NON_JOB_LINK_HOSTS = ("linkedin.com",)
 NON_JOB_LINK_PATH_SEGMENTS = frozenset({"media", "news", "press", "updates", "blog"})
 
 
+_NO_LINK_SCHEMES = ("javascript:", "mailto:", "tel:")
+
+
+def _normalise_href(href, base_url):
+    """An absolute URL for a link, or None when it is not a link to a page.
+
+    Only hrefs starting with "/" used to be joined to the page URL, so "#",
+    "javascript:void(0)" and bare relative links ("jobs/123") were stored as
+    the posting's URL as-is - and a posting's URL is its identity, so those
+    could collide across companies in dedupe_jobs_by_url(). None falls back
+    to the careers page URL, as a missing href always has."""
+    if not href:
+        return None
+    href = href.strip()
+    if not href or href.startswith("#") or href.lower().startswith(_NO_LINK_SCHEMES):
+        return None
+    return urljoin(base_url, href)
+
+
 def _looks_like_non_job_link(href):
     if not href:
         return False
@@ -223,32 +243,63 @@ def fetch_jobs(company_name, careers_url, html=None):
     if html is None:
         resp = session.get(careers_url, headers=HEADERS, timeout=15)
         resp.raise_for_status()
-        html = resp.text
+        html = response_text(resp)
     soup = BeautifulSoup(html, "html.parser")
 
     if company_name in OVERRIDES:
         elements = soup.select(OVERRIDES[company_name])
         titles = [el.get_text(" ", strip=True) for el in elements]
-        links = [el.get("href") if el.name == "a" else None for el in elements]
+        # A selector often targets an <h3>/<span>/<div> rather than the <a>
+        # itself; look at the element, then its enclosing anchor, then an
+        # anchor inside it, before concluding it has no link.
+        links = []
+        for el in elements:
+            anchor = el if el.name == "a" else (el.find_parent("a") or el.find("a"))
+            links.append(_normalise_href(anchor.get("href"), careers_url) if anchor else None)
     else:
         titles, links = _generic_extract(soup, careers_url)
 
+    # A posting's URL is its identity downstream, so a job with no link of
+    # its own must not borrow the careers page's: every such job shared one
+    # cache key and one Notion dedup key and they collapsed into a single row
+    # (punch list #5). Skip them, and count them.
     jobs = []
-    seen = set()
+    seen_urls = set()
+    candidates = 0
+    no_link = 0
     for title, link in zip(titles, links):
         title = title.strip()
-        if not title or title.lower() in seen:
+        if not title:
             continue
-        seen.add(title.lower())
+        candidates += 1
+        if not link:
+            no_link += 1
+            continue
+        # Dedup on the resolved URL, not the title: one title in two
+        # locations is two postings with two URLs, and the same URL repeated
+        # is one posting however it is titled.
+        if link in seen_urls:
+            continue
+        seen_urls.add(link)
         jobs.append({
             "company": company_name,
             "title": title,
             "location": None,  # generic scraper doesn't reliably find this
-            "url": link if link else careers_url,
+            "url": link,
             "posted_at": None,
             "description": None,  # generic scraper has no reliable way to find posting text
             "source_ats": "HTML (generic scrape)",
         })
+
+    if no_link:
+        print(f"[scrape] {company_name}: {len(jobs)} jobs, {no_link} skipped (no link)")
+    if candidates and not jobs:
+        # Titles that looked like jobs but not one with a usable link is not
+        # an empty board (invariant 23): returning [] would let the close pass
+        # retire every row for this company.
+        raise ScrapeShapeError(
+            f"{company_name}: found {candidates} job-looking title(s) on {careers_url} "
+            f"but none with a usable link, so the page is not being read as an empty board")
 
     return jobs
 
@@ -265,10 +316,7 @@ def _generic_extract(soup, base_url):
         if not JOB_TITLE_HINTS.search(text):
             continue
 
-        href = a.get("href")
-        if href and href.startswith("/"):
-            from urllib.parse import urljoin
-            href = urljoin(base_url, href)
+        href = _normalise_href(a.get("href"), base_url)
 
         if _looks_like_non_job_link(href):
             continue

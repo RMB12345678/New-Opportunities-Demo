@@ -26,6 +26,7 @@ from urllib.parse import urlparse
 
 from ats_finder.find_ats import ANTHROPIC_API_KEY
 from http_client import session
+from ats_finder.careers_url import ensure_scheme
 
 # Hosts that are an ATS, job board, or social/profile site, not a company's
 # own domain. A Careers URL landing on one of these says nothing about
@@ -151,7 +152,7 @@ def find_website_homepage(company_name, hq=None):
         return None
 
     urls = re.findall(r"https?://\S+", text)
-    raw = urls[0].rstrip(").,;\"'") if urls else text
+    raw = urls[0].rstrip(").,;\"'") if urls else ensure_scheme(text.rstrip(").,;\"'"))
     return raw
 
 

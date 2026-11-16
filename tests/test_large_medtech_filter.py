@@ -57,12 +57,12 @@ def test_prepare_jobs_filters_only_the_large_medtech_tier():
 def test_run_scrapers_filters_before_returning(monkeypatch):
     monkeypatch.setitem(run.SCRAPERS, "Greenhouse",
                         lambda name, slug=None: [_job("VP, Sales"), _job("Nurse")])
-    row = {"company": "Big Co", "tier": "Large MedTech", "sector": "s",
+    row = {"page_id": "pg-big", "company": "Big Co", "tier": "Large MedTech", "sector": "s",
            "ats_platform": "Greenhouse", "scrape_method": "API",
            "careers_url": "https://boards.greenhouse.io/bigco"}
     jobs, scraped_ok, statuses = run.run_scrapers([row])
     assert [j["title"] for j in jobs] == ["VP, Sales"]
-    assert "Big Co" in scraped_ok
+    assert "pg-big" in scraped_ok
 
 
 def test_tier_line_present_only_for_tiered_jobs():

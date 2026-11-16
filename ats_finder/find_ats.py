@@ -4,7 +4,7 @@ this was done manually while building the initial target list.
 
 Strategy:
 1. Try a handful of known URL patterns directly (fast path, no API cost):
-   Greenhouse, Lever, Ashby, Workable, Comeet, SmartRecruiters, Recruitee.
+   Greenhouse, Lever and Ashby (see KNOWN_PATTERNS).
 2. If none match, fall back to the Anthropic API with the web_search tool
    to search for "<company> careers" and classify the result.
 
@@ -16,7 +16,8 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from http_client import session
+from http_client import session, third_party_session
+from ats_finder.careers_url import ensure_scheme
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 
@@ -136,7 +137,11 @@ def sniff_ats_from_page(careers_url, html=None):
     corpus = []
     if html is None:
         try:
-            resp = _guess_session.get(careers_url, headers=_SNIFF_UA, timeout=15)
+            # third_party_session, not _guess_session: this fetches an
+            # arbitrary company's careers page, and _guess_session honours
+            # Retry-After, which is how one site's huge value froze a run
+            # (invariant 25).
+            resp = third_party_session.get(careers_url, headers=_SNIFF_UA, timeout=15)
         except requests.RequestException:
             return None
         if resp.status_code != 200:
@@ -346,7 +351,7 @@ HOMEPAGE: <the company's main website URL (e.g. "https://example.com"), or "N/A"
             return raw
         all_urls = re.findall(r"https?://\S+", raw)
         if not all_urls:
-            return raw
+            return ensure_scheme(raw.strip().rstrip(").,;\"'"))
 
         known_ats_domains = ("greenhouse.io", "lever.co", "ashbyhq.com",
                              "myworkdayjobs.com", "oraclecloud.com", "icims.com",
@@ -430,7 +435,13 @@ def find_company_info(company_name, hq=None, known_platform=None):
             info["sniffed_from_page"] = sniffed["evidence"]
             return info
 
-    if not info["ambiguous"]:
+    # A guess may FILL an unresolved answer but never replace a researched one.
+    # try_known_patterns() proves only that a board with slugify(name) exists
+    # on Greenhouse/Lever/Ashby, not that it is this company's; letting it
+    # overwrite a researched platform attached another company's postings,
+    # invisibly (invariant 19's failure by another route). Punch list #32.
+    if (not info["ambiguous"]
+            and (not info.get("ats_platform") or ats_is_unresolved(info["ats_platform"]))):
         platform, method = try_known_patterns(company_name)
         if platform:
             info["ats_platform"] = platform

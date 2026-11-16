@@ -35,6 +35,7 @@ from dotenv import load_dotenv
 load_dotenv()  # reads the .env file in this folder and loads NOTION_API_KEY, etc.
 
 from notion.client import (
+    CARRY_NEW_PATH,
     get_all_companies, get_companies_missing_ats, get_companies_missing_profile,
     get_companies_missing_url, get_companies_missing_website,
     update_ats_fields, update_company_info, update_company_website,
@@ -50,8 +51,8 @@ from scrapers import (
     rippling, teamtailor, smartrecruiters, pinpoint, html_generic, oracle_rc,
     successfactors,
 )
-from scrapers.common import SENIOR_SEARCH_TERMS
-from scoring.score_jobs import score_all, RUBRIC_FINGERPRINT
+from scrapers.common import SENIOR_SEARCH_TERMS, ALL_POSTINGS_TERMS
+from scoring.score_jobs import score_all, RUBRIC_FINGERPRINT, USAGE as SCORE_USAGE, estimated_cost_usd
 from scoring.track_new_postings import mark_new_postings
 from output_excel import build_workbook
 
@@ -128,6 +129,32 @@ SENIOR_TITLE_RE = re.compile(
 )
 
 
+def _answered_404(error):
+    """True when `error` is an HTTP 404 from the board. Scrapers call
+    raise_for_status(), so a real "no such board" arrives as an HTTPError
+    carrying the response."""
+    return getattr(getattr(error, "response", None), "status_code", None) == 404
+
+
+_MARKER_PREFIXES = ("not found", "ambiguous", "n/a")
+
+
+def clean_sector(value):
+    """The company's Sector / Focus for the scoring prompt, or None when the
+    field holds a pipeline marker instead of a description ("Not found
+    (checked, no info located - clear this field to retry)", "AMBIGUOUS -
+    see console output ..."). The prompt renders None as 'unknown', which is
+    the right signal; the marker text told the model nothing true. Only the
+    copy onto jobs changes - the Notion field itself is not touched
+    (invariant 8 needs the marker there). Cached scores are keyed by URL and
+    are not re-scored by this (punch list #10)."""
+    if not value or not value.strip():
+        return None
+    if value.strip().lower().startswith(_MARKER_PREFIXES):
+        return None
+    return value
+
+
 def prepare_jobs(row, jobs):
     """Stamp company context onto a scraped company's jobs and, for the
     Large MedTech tier only, drop everything that is not a senior title.
@@ -148,7 +175,12 @@ def prepare_jobs(row, jobs):
     """
     tier = row.get("tier")
     for job in jobs:
-        job["company_description"] = row.get("sector")
+        # The page id, not the name, is a company's identity: two Companies
+        # rows can share a name (Neuvotion, NeuroOne), and a name-keyed
+        # relation or scraped_ok would let one row's success vouch for the
+        # other's postings (invariant 2).
+        job["company_page_id"] = row.get("page_id")
+        job["company_description"] = clean_sector(row.get("sector"))
         if tier:
             job["company_tier"] = tier
     if tier not in SENIOR_FILTER_TIERS:
@@ -200,7 +232,7 @@ PLATFORM_ALIASES = {
 }
 
 
-def fill_missing_profile_fields(dry_run=False):
+def fill_missing_profile_fields(dry_run=False, companies=None):
     """Catch-up pass: companies that already have an ATS but are still
     missing Sector or HQ (e.g. added before this fix existed, or hit an
     earlier bug where the fast-path skipped research). Looks up a full
@@ -216,7 +248,7 @@ def fill_missing_profile_fields(dry_run=False):
     dry_run=True skips find_via_search (the Anthropic call) entirely —
     it just lists which companies would have been researched.
     """
-    missing = get_companies_missing_profile()
+    missing = get_companies_missing_profile(companies)
     if not missing:
         print("[check] Every company already has sector/HQ filled in. Continuing.")
         return
@@ -264,7 +296,7 @@ def fill_missing_profile_fields(dry_run=False):
         time.sleep(1)
 
 
-def fill_missing_ats(dry_run=False):
+def fill_missing_ats(dry_run=False, companies=None):
     """For any company with a blank ATS Platform (the signal that it's a
     newly added, not-yet-researched company), look up its FULL profile —
     sector, HQ, ATS, careers URL — in one pass and write it all back.
@@ -281,7 +313,7 @@ def fill_missing_ats(dry_run=False):
     dry_run=True skips find_company_info (the Anthropic call) entirely —
     it just lists which companies would have been researched.
     """
-    missing = get_companies_missing_ats()
+    missing = get_companies_missing_ats(companies)
     if not missing:
         print("[check] Every company already has an ATS value. Continuing.")
         return
@@ -351,7 +383,7 @@ def google_search_fallback_url(company_name):
     return f"https://www.google.com/search?q={query}"
 
 
-def fill_missing_careers_urls(dry_run=False):
+def fill_missing_careers_urls(dry_run=False, companies=None):
     """Any company missing a saved Careers URL — regardless of whether it's
     API-tier or HTML-scrape — gets one looked up now. This used to only
     check HTML-scrape companies, which silently starved the API scrapers
@@ -367,7 +399,7 @@ def fill_missing_careers_urls(dry_run=False):
     dry_run=True skips find_company_info (the Anthropic call) entirely —
     it just lists which companies would have been researched.
     """
-    missing = get_companies_missing_url()
+    missing = get_companies_missing_url(companies)
     if not missing:
         print("[check] Every company already has a Careers URL. Continuing.")
         return
@@ -420,7 +452,7 @@ def fill_missing_careers_urls(dry_run=False):
         time.sleep(1)
 
 
-def fill_missing_website(dry_run=False):
+def fill_missing_website(dry_run=False, companies=None):
     """Backfill each company's Website property, and stamp its page icon
     with a real logo (or a blank marker) either way — see
     ats_finder/find_website.py for the derivation logic and
@@ -438,7 +470,7 @@ def fill_missing_website(dry_run=False):
     it just lists which companies would be checked, same contract as the
     other fill_missing_* passes above.
     """
-    missing = get_companies_missing_website()
+    missing = get_companies_missing_website(companies)
     if not missing:
         print("[check] Every company already has a Website (or was already checked). Continuing.")
         return
@@ -485,6 +517,26 @@ def fill_missing_website(dry_run=False):
           f"{skipped} left for retry next run")
 
 
+# A platform name that follows one of these (within the same clause) is being
+# ruled OUT or given as an example, not claimed: Siemens Healthineers' ATS
+# field is an "in-house ... not a standard ATS like Greenhouse/Lever/Workday"
+# sentence, which matched three platforms and scraped a guessed Greenhouse
+# board that does not exist (punch list #27).
+_NEGATING_CONTEXT = re.compile(
+    r"\b(not|no|isn'?t|unlike|like|such as|e\.g\.?|i\.e\.?|rather than|instead of|"
+    r"other than|neither|nor)\b[^.;\n]*$", re.IGNORECASE)
+
+
+def _names_platform(text, spelling):
+    """True when `text` names `spelling` as the company's platform: a
+    whole-word match that is not preceded, in its clause, by a negation or
+    an example marker."""
+    for m in re.finditer(rf"\b{re.escape(spelling)}\b", text, re.IGNORECASE):
+        if not _NEGATING_CONTEXT.search(text[:m.start()]):
+            return True
+    return False
+
+
 def resolve_scraper(platform_raw):
     """Find a matching scraper for a company's ATS Platform text field.
 
@@ -504,8 +556,7 @@ def resolve_scraper(platform_raw):
     matches = []
     for name, fn in SCRAPERS.items():
         spellings = [name] + PLATFORM_ALIASES.get(name, [])
-        if any(re.search(rf"\b{re.escape(sp)}\b", platform_raw, re.IGNORECASE)
-               for sp in spellings):
+        if any(_names_platform(platform_raw, sp) for sp in spellings):
             matches.append((name, fn))
 
     if not matches:
@@ -590,6 +641,27 @@ def extract_workday_params(careers_url):
     return workday.parse_board_url(careers_url)
 
 
+def drop_urlless_jobs(jobs):
+    """Remove jobs with no URL, and say which companies lost them.
+
+    A URL is a posting's identity and the sync skips a job without one, but
+    _job_key() falls back to "company::title" so such a job was still SCORED
+    and cached - paid for, then dropped (punch list #11). Dropping them here,
+    before scoring, spends nothing on them. They are counted, never silent."""
+    kept = [j for j in jobs if j.get("url")]
+    lost = len(jobs) - len(kept)
+    if lost:
+        by_company = {}
+        for j in jobs:
+            if not j.get("url"):
+                by_company[j.get("company")] = by_company.get(j.get("company"), 0) + 1
+        detail = ", ".join(f"{c} x{n}" for c, n in sorted(by_company.items(),
+                                                          key=lambda kv: -kv[1])[:10])
+        print(f"[scrape] dropped {lost} posting(s) with no URL before scoring "
+              f"(no identity, so the sync could never hold them): {detail}")
+    return kept
+
+
 def dedupe_jobs_by_url(jobs):
     """Collapse jobs that share a URL, keeping the first of each.
 
@@ -663,7 +735,7 @@ def dedupe_jobs_by_url(jobs):
 def run_scrapers(companies):
     """Scrape every company and return (all_jobs, scraped_ok, statuses).
 
-    scraped_ok is the set of company names whose scraper returned without
+    scraped_ok is the set of Companies page ids whose scraper returned without
     raising. It exists so sync_jobs_to_notion() can tell "this company's
     postings are genuinely gone" apart from "we never got a usable answer
     about this company at all". Without that distinction, a timeout or a
@@ -698,7 +770,14 @@ def run_scrapers(companies):
     def record(row, status, note=""):
         statuses.append({"row": row, "status": status, "note": note})
 
+    unnamed = 0
     for row in companies:
+        # A Companies row with no name cannot be scraped meaningfully (the
+        # slug guess would be slugify(None)) and carries no postings to
+        # close. Skip it and say how many, rather than fail it every run.
+        if not (row.get("company") or "").strip():
+            unnamed += 1
+            continue
         scraper, matched_name = resolve_scraper(row["ats_platform"])
 
         # Workday takes its own path: its scraper needs four parameters
@@ -732,7 +811,7 @@ def run_scrapers(companies):
                 jobs = workday.fetch_jobs(row["company"], search_terms=terms, **params)
                 jobs = prepare_jobs(row, jobs)
                 all_jobs.extend(jobs)
-                scraped_ok.add(row["company"])
+                scraped_ok.add(row["page_id"])
                 filtered = " filtered to this company" if params["applied_facets"] else ""
                 print(f"[scrape] {row['company']} (via Workday, "
                       f"{params['tenant']}/{params['site']}{filtered}): {len(jobs)} jobs")
@@ -753,10 +832,16 @@ def run_scrapers(companies):
                        f"can't be guessed from the company name.")
                 continue
             try:
-                jobs = scraper(row["company"], row["careers_url"])
+                # Terms by tier, as the Workday branch does: only a tiered
+                # company is behind the senior filter, so only it may be
+                # read through the senior search terms. Anyone else keeps
+                # every posting (invariant 22), which means the whole board.
+                terms = (SENIOR_SEARCH_TERMS if row.get("tier") in SENIOR_FILTER_TIERS
+                         else ALL_POSTINGS_TERMS)
+                jobs = scraper(row["company"], row["careers_url"], search_terms=terms)
                 jobs = prepare_jobs(row, jobs)
                 all_jobs.extend(jobs)
-                scraped_ok.add(row["company"])
+                scraped_ok.add(row["page_id"])
                 print(f"[scrape] {row['company']} (via {matched_name}): {len(jobs)} jobs")
                 record(row, SCRAPE_OK, f"{matched_name}: {len(jobs)} job(s)")
             except Exception as error:
@@ -794,7 +879,7 @@ def run_scrapers(companies):
                 jobs = scraper(row["company"], slug=slug) if slug else scraper(row["company"])
                 jobs = prepare_jobs(row, jobs)
                 all_jobs.extend(jobs)
-                scraped_ok.add(row["company"])
+                scraped_ok.add(row["page_id"])
                 slug_note = f", slug from {slug_source}" if slug else ""
                 print(f"[scrape] {row['company']} (via {matched_name}{slug_note}): {len(jobs)} jobs")
                 record(row, SCRAPE_OK, f"{matched_name}: {len(jobs)} job(s)")
@@ -803,12 +888,24 @@ def run_scrapers(companies):
                 # If we had a confirmed slug and it still failed (URL moved,
                 # company renamed on the platform, etc.), fall back to a
                 # guessed slug as a second attempt before giving up.
+                if slug and not _answered_404(first_error):
+                    # A timeout, a 429 or a 5xx says nothing about whether the
+                    # saved slug is wrong, and a guessed slug that happens to
+                    # answer would be another company's board entering
+                    # scraped_ok. Only a 404 on the saved slug earns a guess.
+                    print(f"[scrape] {row['company']}: FAILED ({first_error}) — saved "
+                          f"slug did not answer 404, so not guessing another")
+                    record(row, SCRAPE_FAILED,
+                           f"{matched_name}: {first_error}. The slug from the saved "
+                           f"Careers URL did not 404 (it may be down or rate limiting), "
+                           f"so no guessed slug was tried.")
+                    continue
                 if slug:
                     try:
                         jobs = scraper(row["company"])  # no slug = falls back to guessing
                         jobs = prepare_jobs(row, jobs)
                         all_jobs.extend(jobs)
-                        scraped_ok.add(row["company"])
+                        scraped_ok.add(row["page_id"])
                         print(f"[scrape] {row['company']} (via {matched_name}, "
                               f"saved URL failed, guessed slug worked): {len(jobs)} jobs")
                         # Scraped fine, so not a manual-check case — but the
@@ -869,7 +966,7 @@ def run_scrapers(companies):
                     jobs = embedded_scraper(row["company"], slug=found_slug)
                     jobs = prepare_jobs(row, jobs)
                     all_jobs.extend(jobs)
-                    scraped_ok.add(row["company"])
+                    scraped_ok.add(row["page_id"])
                     print(f"[scrape] {row['company']} (via {found_platform}, "
                           f"slug '{found_slug}' from the careers page): {len(jobs)} jobs")
                     record(row, SCRAPE_OK,
@@ -880,19 +977,24 @@ def run_scrapers(companies):
                     continue
                 except Exception as e:
                     # The board was named by the page but did not answer.
-                    # Fall through to the HTML scraper rather than giving
-                    # up: the page is still a page, and it is what this
-                    # company got before detection existed.
+                    # Do NOT fall through to the HTML scraper (invariant 2):
+                    # an embed/redirect page has no job-shaped links, so it
+                    # would return [] and the company would be stamped OK,
+                    # and the close pass would then close every one of its
+                    # rows over what was only an outage.
                     print(f"[scrape] {row['company']}: {found_platform} board "
-                          f"'{found_slug}' found on the page but failed ({e}) "
-                          f"— falling back to the HTML scraper")
+                          f"'{found_slug}' found on the page but FAILED ({e})")
+                    record(row, SCRAPE_FAILED,
+                           f"{found_platform} board '{found_slug}' was found on "
+                           f"{row['careers_url']} but its scrape failed: {e}")
+                    continue
 
             try:
                 jobs = html_generic.fetch_jobs(row["company"], row["careers_url"],
                                                html=page_html)
                 jobs = prepare_jobs(row, jobs)
                 all_jobs.extend(jobs)
-                scraped_ok.add(row["company"])
+                scraped_ok.add(row["page_id"])
                 print(f"[scrape] {row['company']} (via HTML): {len(jobs)} jobs")
                 record(row, SCRAPE_OK, f"HTML: {len(jobs)} job(s)")
             except Exception as e:
@@ -913,7 +1015,50 @@ def run_scrapers(companies):
                    f"\"{method}\". Either the platform needs a scraper written, or the "
                    f"row needs marking as HTML-scrapeable.")
 
+    if unnamed:
+        print(f"[scrape] skipped {unnamed} Companies row(s) with no company name")
     return all_jobs, scraped_ok, statuses
+
+
+def build_run_summary(*, dry_run, companies, scraped_ok, statuses, jobs, sync_result):
+    """The structured record of one run (punch list #17): what was scraped,
+    found, scored, written and spent, and how many companies failed and why.
+    Pure - takes what main() already has - so it is testable offline."""
+    by_status = {}
+    for s in statuses:
+        by_status[s["status"]] = by_status.get(s["status"], 0) + 1
+    return {
+        "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "dry_run": bool(dry_run),
+        "rubric_fingerprint": RUBRIC_FINGERPRINT,
+        "companies": len(companies),
+        "companies_scraped_ok": len(scraped_ok),
+        "companies_by_scrape_status": by_status,
+        "jobs": len(jobs),
+        "jobs_new_in_notion": sum(1 for j in jobs if j.get("is_new")),
+        "jobs_scored": sum(1 for j in jobs if j.get("score") is not None),
+        "scoring_usage": dict(SCORE_USAGE),
+        "scoring_cost_usd_estimate": round(estimated_cost_usd(SCORE_USAGE), 4),
+        "notion": {k: sync_result.get(k) for k in (
+            "created", "updated", "unchanged", "closed", "unflagged", "failed",
+            "left_open", "left_open_unresolved", "close_aborted")},
+    }
+
+
+def print_run_digest(summary):
+    n = summary["notion"]
+    print("\n=== Run digest ===")
+    print(f"  companies : {summary['companies_scraped_ok']} of {summary['companies']} scraped OK "
+          f"{summary['companies_by_scrape_status']}")
+    print(f"  jobs      : {summary['jobs']} ({summary['jobs_new_in_notion']} new, "
+          f"{summary['jobs_scored']} scored)")
+    print(f"  scoring   : ~${summary['scoring_cost_usd_estimate']:.2f} "
+          f"({summary['scoring_usage']['calls']} call(s))")
+    print(f"  notion    : {n['created']} created, {n['updated']} updated, "
+          f"{n['unchanged']} unchanged, {n['closed']} closed, {n['failed']} failed")
+    print(f"  close pass: {'ABORTED by the 25% valve' if n['close_aborted'] else 'ran'}; "
+          f"{n['left_open']} left open (failed scrape), "
+          f"{n['left_open_unresolved']} left open (unresolved company)")
 
 
 def main():
@@ -928,26 +1073,38 @@ def main():
     if dry_run:
         print("=== DRY RUN — no Notion writes or Anthropic calls will be made ===")
 
+    # Two reads of Companies, not four (punch list #12). The first snapshot
+    # feeds steps 1-3, which is safe because each only selects rows that LACK
+    # something the earlier one fills: a row step 1 just researched has an ATS,
+    # sector, HQ and URL written, but not in this snapshot, so steps 2 and 3
+    # (which both require an ATS) correctly leave it alone. The second read,
+    # after step 3 has written, feeds step 4 and the scrape: step 4 needs the
+    # Careers URLs step 3 just saved, and the scrape needs everything current.
+    print("=== Reading the Companies list (1 of 2) ===")
+    with timed("0  get_all_companies"):
+        snapshot = get_all_companies()
+    print(f"{len(snapshot)} total companies")
+
     print("=== Step 1-2: checking Notion for companies missing ATS data ===")
     with timed("1  fill_missing_ats"):
-        fill_missing_ats(dry_run=dry_run)
+        fill_missing_ats(dry_run=dry_run, companies=snapshot)
 
     print("\n=== Step 2a: backfilling sector/HQ for companies missing it ===")
     with timed("2  fill_missing_profile_fields"):
-        fill_missing_profile_fields(dry_run=dry_run)
+        fill_missing_profile_fields(dry_run=dry_run, companies=snapshot)
 
     print("\n=== Step 2b: checking for HTML-scrape companies missing a Careers URL ===")
     with timed("3  fill_missing_careers_urls"):
-        fill_missing_careers_urls(dry_run=dry_run)
+        fill_missing_careers_urls(dry_run=dry_run, companies=snapshot)
 
-    print("\n=== Step 2c: filling in company Website + logo where derivable ===")
-    with timed("3b fill_missing_website"):
-        fill_missing_website(dry_run=dry_run)
-
-    print("\n=== Step 3: re-pulling full company list ===")
+    print("\n=== Step 3: re-pulling full company list (2 of 2) ===")
     with timed("3a get_all_companies"):
         companies = get_all_companies()
     print(f"{len(companies)} total companies")
+
+    print("\n=== Step 2c: filling in company Website + logo where derivable ===")
+    with timed("3b fill_missing_website"):
+        fill_missing_website(dry_run=dry_run, companies=companies)
 
     print("\n=== Step 4-5: scraping API-backed companies ===")
     with timed("4  run_scrapers"):
@@ -958,6 +1115,7 @@ def main():
     print("\n=== Step 5a: collapsing postings that share a URL ===")
     with timed("4b dedupe_jobs_by_url"):
         jobs = dedupe_jobs_by_url(jobs)
+    jobs = drop_urlless_jobs(jobs)
     print(f"{len(jobs)} posting(s) with a distinct URL go forward to scoring and Notion")
 
     print("\n=== Step 5b: stamping scrape status onto Companies ===")
@@ -987,9 +1145,10 @@ def main():
 
     print("\n=== Step 8: syncing jobs to Notion ===")
     # One-off hand-off from an interrupted run: output/carry_new_this_run.json
-    # lists page ids that run created. Deleted only after a real sync, so a
-    # second interruption leaves it in place for the next attempt.
-    carry_path = os.path.join("output", "carry_new_this_run.json")
+    # lists page ids that run created. The sync itself keeps it up to date as
+    # it creates rows and deletes it on completion, so a second interruption
+    # leaves it in place for the next attempt.
+    carry_path = CARRY_NEW_PATH
     carry_new_ids = []
     if os.path.exists(carry_path):
         with open(carry_path, encoding="utf-8") as f:
@@ -998,8 +1157,7 @@ def main():
         sync_result = sync_jobs_to_notion(jobs, scraped_ok, dry_run=dry_run,
                                           rubric_fingerprint=RUBRIC_FINGERPRINT,
                                           carry_new_ids=carry_new_ids)
-    if carry_new_ids and not dry_run:
-        os.remove(carry_path)
+    # sync_jobs_to_notion() deletes the file itself when it runs to the end.
     print(f"{'[dry-run] would sync' if dry_run else 'Notion'}: "
           f"{sync_result['created']} created, {sync_result['updated']} updated, "
           f"{sync_result['unchanged']} unchanged (not written), "
@@ -1047,6 +1205,15 @@ def main():
     print(f"{len(needs_check)} companies need manual checking — see the "
           f"\"Needs Manual Check\" view in Notion, or output/skipped_companies.json")
     print(f"Formatted Excel version: {excel_path}")
+
+    summary = build_run_summary(dry_run=dry_run, companies=companies, scraped_ok=scraped_ok,
+                                statuses=statuses, jobs=jobs, sync_result=sync_result)
+    print_run_digest(summary)
+    # Not written on a dry run: it would describe a run that never synced (the
+    # same reason #51 is a live concern for jobs.json).
+    if not dry_run:
+        with open("output/run_summary.json", "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
 
     print_timing_report()
     print_api_report(dry_run=dry_run)

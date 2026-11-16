@@ -90,7 +90,7 @@ def job(url="http://acme/1", **overrides):
     return base
 
 
-def sync(existing_rows, jobs, scraped_ok=frozenset({ACME}), dry_run=False,
+def sync(existing_rows, jobs, scraped_ok=frozenset({"pg-acme"}), dry_run=False,
          carry_new_ids=None):
     """Run sync_jobs_to_notion against stubbed Notion queries.
 

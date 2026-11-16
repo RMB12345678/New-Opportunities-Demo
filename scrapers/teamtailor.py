@@ -21,6 +21,7 @@ is: a wrong guess 404s inside the vendor's namespace rather than resolving
 to some other company's board.
 """
 from http_client import session
+from scrapers.common import require_list
 
 from ats_finder.find_ats import slugify
 
@@ -56,7 +57,7 @@ def fetch_jobs(company_name, slug=None):
     host = slug or f"{slugify(company_name)}.teamtailor.com"
     resp = session.get(f"https://{host}/jobs.json", timeout=15)
     resp.raise_for_status()
-    items = resp.json().get("items", [])
+    items = require_list(resp.json(), "items", "Teamtailor")
 
     return [
         {

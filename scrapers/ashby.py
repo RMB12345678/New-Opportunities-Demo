@@ -2,6 +2,7 @@
 from urllib.parse import quote
 
 from http_client import session
+from scrapers.common import require_list
 
 from ats_finder.find_ats import slugify
 
@@ -19,7 +20,7 @@ def fetch_jobs(company_name, slug=None):
     url = f"https://api.ashbyhq.com/posting-api/job-board/{quote(slug)}"
     resp = session.get(url, timeout=10)
     resp.raise_for_status()
-    jobs = resp.json().get("jobs", [])
+    jobs = require_list(resp.json(), "jobs", "Ashby")
 
     return [
         {

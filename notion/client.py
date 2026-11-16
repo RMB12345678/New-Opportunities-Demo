@@ -13,18 +13,30 @@ found in its page URL).
 """
 import collections
 import datetime
+import json
 import os
+import re
 import time
 import requests
 
-from http_client import session
+from http_client import session, create_session
 from notion import state
 from ats_finder.careers_url import is_usable_careers_url
 from ats_finder.find_website import is_company_domain
 
-NOTION_API_KEY = os.environ["NOTION_API_KEY"]
-NOTION_DATABASE_ID = os.environ["NOTION_DATABASE_ID"]
-JOB_POSTINGS_DATABASE_ID = os.environ["JOB_POSTINGS_DATABASE_ID"]
+def _require_env(name):
+    """os.environ[name], but a failure says where the value belongs instead
+    of a bare KeyError on import (punch list #12). Never prints the value."""
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(f"{name} is not set - add it to the .env file in the repo "
+                           f"root (see .env.example).")
+    return value
+
+
+NOTION_API_KEY = _require_env("NOTION_API_KEY")
+NOTION_DATABASE_ID = _require_env("NOTION_DATABASE_ID")
+JOB_POSTINGS_DATABASE_ID = _require_env("JOB_POSTINGS_DATABASE_ID")
 NOTION_VERSION = "2022-06-28"
 
 # Seconds. The retry session only bounds a connect/read; with no timeout a
@@ -56,6 +68,22 @@ SCRAPE_NO_SCRAPER = "No Scraper"      # nothing matched this ATS Platform value
 SCRAPE_NO_URL = "No Careers URL"      # marked HTML-scrapeable with nothing to fetch
 
 BASE_URL = "https://api.notion.com/v1"
+
+# Page ids of rows this sync has created, written as it goes and deleted when
+# the sync completes. A run killed mid-sync leaves it behind, and the next run
+# reads it (run.py) so those rows keep New This Run instead of being cleared as
+# "existing". Relative to the working directory, like the rest of output/.
+CARRY_NEW_PATH = os.path.join("output", "carry_new_this_run.json")
+
+
+def _write_carry_file(ids):
+    """Atomically rewrite the carry file with `ids` (temp file + replace, so
+    an interruption cannot leave truncated JSON that run.py would choke on)."""
+    os.makedirs(os.path.dirname(CARRY_NEW_PATH) or ".", exist_ok=True)
+    tmp = CARRY_NEW_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(sorted(ids), f)
+    os.replace(tmp, CARRY_NEW_PATH)
 HEADERS = {
     "Authorization": f"Bearer {NOTION_API_KEY}",
     "Notion-Version": NOTION_VERSION,
@@ -161,24 +189,51 @@ def get_all_companies():
     return rows
 
 
-def get_companies_missing_ats():
+def _drop_unnamed(rows, selector):
+    """Drop Companies rows with no company name, and say how many.
+
+    A blank-named row has a blank ATS, so every selector would pick it and
+    fill_missing_ats() would pay to research "None", then crash in
+    slugify(None) and log "will retry next run" - forever. There is nothing
+    to research without a name, so it is skipped, not failed."""
+    named = [r for r in rows if (r.get("company") or "").strip()]
+    if len(named) != len(rows):
+        print(f"[{selector}] skipped {len(rows) - len(named)} Companies row(s) "
+              f"with no company name")
+    return named
+
+
+def _rows(companies):
+    """The list a selector filters: the caller's, or a fresh read.
+
+    Every get_companies_missing_*() used to call get_all_companies() itself -
+    four paginated scans of an unchanged table per run, taken at different
+    moments while earlier steps were writing back (punch list #12). They are
+    now pure filters over `companies` when one is passed; with none passed
+    they read their own, so standalone callers are unchanged."""
+    return companies if companies is not None else get_all_companies()
+
+
+def get_companies_missing_ats(companies=None):
     """Return only rows where ATS Platform is empty."""
-    return [row for row in get_all_companies() if not row["ats_platform"]]
+    return _drop_unnamed(
+        [row for row in _rows(companies) if not row["ats_platform"]],
+        "missing ats")
 
 
-def get_companies_missing_profile():
+def get_companies_missing_profile(companies=None):
     """Return rows that have an ATS Platform filled in (so they won't be
     caught by get_companies_missing_ats) but are still missing Sector or
     HQ — e.g. companies added before the full-profile auto-fill existed,
     or ones that hit the old fast-path-only bug."""
-    return [
-        row for row in get_all_companies()
+    return _drop_unnamed([
+        row for row in _rows(companies)
         if row["ats_platform"] and "AMBIGUOUS" not in row["ats_platform"]
         and (not row["sector"] or not row["hq"])
-    ]
+    ], "missing profile")
 
 
-def get_companies_missing_url():
+def get_companies_missing_url(companies=None):
     """Return ANY company missing a Careers URL, regardless of scrape
     method — this used to only check HTML-scrape companies, which meant
     API-tier companies (Greenhouse/Lever/Ashby) that already had their ATS,
@@ -207,21 +262,21 @@ def get_companies_missing_url():
     a URL that is merely stale or unreachable still passes — that is a
     scrape failure, which sync_scrape_status() already surfaces, and
     judging liveness here would collide with invariant 1."""
-    return [
-        row for row in get_all_companies()
+    return _drop_unnamed([
+        row for row in _rows(companies)
         if row["ats_platform"]
         and "AMBIGUOUS" not in row["ats_platform"]
         and "N/A" not in row["ats_platform"]
         and "Not found" not in row["ats_platform"]
         and not is_usable_careers_url(row["careers_url"])
-    ]
+    ], "missing careers url")
 
 
 # Kept for backward compatibility with any code still importing the old name.
 get_html_companies_missing_url = get_companies_missing_url
 
 
-def get_companies_missing_website():
+def get_companies_missing_website(companies=None):
     """Return companies with no confirmed Website AND no page icon yet.
 
     Website is a Notion URL-type property, so — unlike ATS Platform — it
@@ -240,8 +295,8 @@ def get_companies_missing_website():
     hand for an unrelated reason will look identical to an already-checked
     one and won't be retried.
     """
-    return [
-        row for row in get_all_companies()
+    return _drop_unnamed([
+        row for row in _rows(companies)
         if (not row["website"] and not row["has_icon"])
         # A Website that points somewhere it can never point — see
         # is_company_domain() — is wrong no matter what the icon says, and
@@ -250,7 +305,7 @@ def get_companies_missing_website():
         # value either way, with a real host or with a cleared field plus
         # the BLANK_ICON stamp, and neither outcome is reselected.
         or (row["website"] and not is_company_domain(row["website"]))
-    ]
+    ], "missing website")
 
 
 def update_company_website(page_id, website=None, icon=None, dry_run=False):
@@ -380,7 +435,7 @@ def sync_scrape_status(statuses, dry_run=False):
     for record in statuses:
         row = record["row"]
         status = record["status"]
-        note = record.get("note") or ""
+        note = _normalise_scrape_note(record.get("note"))
 
         was_failing = row.get("scrape_status") not in (None, SCRAPE_OK)
         if status == SCRAPE_OK:
@@ -391,7 +446,7 @@ def sync_scrape_status(statuses, dry_run=False):
             failing_since = today
 
         if (status == row.get("scrape_status")
-                and note == (row.get("scrape_note") or "")
+                and note == _normalise_scrape_note(row.get("scrape_note"))
                 and failing_since == row.get("failing_since")):
             unchanged += 1
             continue
@@ -410,6 +465,23 @@ def sync_scrape_status(statuses, dry_run=False):
     return {"written": written, "unchanged": unchanged, "failed": failed}
 
 
+_OBJECT_ADDRESS = re.compile(r"\s*object at 0x[0-9A-Fa-f]+")
+SCRAPE_NOTE_MAX = 2000
+
+
+def _normalise_scrape_note(note):
+    """The note exactly as it will be stored, for the comparison AND the write.
+
+    Invariant 13's trap: a connection error's text carries
+    `<... object at 0x1F3A...>`, an address that differs on every run, so a
+    DNS-dead company's note could never equal what Notion held and was
+    rewritten every run; and a note over 2,000 characters is stored truncated
+    but was compared untruncated. Normalising both sides identically is the
+    only fix that cannot drift."""
+    note = _OBJECT_ADDRESS.sub("", note or "")
+    return note[:SCRAPE_NOTE_MAX]
+
+
 def _write_scrape_status(page_id, status, note, failing_since, dry_run=False):
     """Write the three Scrape Status properties onto one Companies page.
 
@@ -422,7 +494,7 @@ def _write_scrape_status(page_id, status, note, failing_since, dry_run=False):
     properties = {
         "Scrape Status": {"select": {"name": status}},
         "Scrape Note": (
-            {"rich_text": [{"text": {"content": note[:2000]}}]} if note
+            {"rich_text": [{"text": {"content": _normalise_scrape_note(note)}}]} if note
             else {"rich_text": []}
         ),
         "Failing Since": {"date": {"start": failing_since} if failing_since else None},
@@ -545,6 +617,9 @@ def _desired_write_properties(job, company_page_id):
     return properties
 
 
+_SCORER_OWNED_FIELDS = ("Score", "Routing", "Reasoning", "Ambiguity Note", "IC Role")
+
+
 def _changed_job_properties(job, row, company_page_id):
     """Return only the properties whose value actually differs from what
     Notion holds for this row, in write form. An empty dict means the row
@@ -554,8 +629,17 @@ def _changed_job_properties(job, row, company_page_id):
     desired = _desired_job_fields(job)
     current = _current_job_fields(row)
 
+    # A failed score (score None) comes back from the scorer with a
+    # "Scoring failed" Reasoning, an ambiguity note, IC Role False and
+    # routing "Needs review" - all of it placeholder, none of it an answer.
+    # Skip every scorer-owned field so an existing good row keeps its
+    # Routing, Reasoning and IC Role until a run that actually scores it.
+    scoring_failed = desired.get("Score") is None
+
     changed = {}
     for key, want in desired.items():
+        if scoring_failed and key in _SCORER_OWNED_FIELDS:
+            continue
         # None means "no answer this run", not "clear the field" — the same
         # convention update_company_info() uses, and for the same reason. A
         # job whose scoring failed comes back with score and routing None;
@@ -656,7 +740,7 @@ def sync_jobs_to_notion(jobs, scraped_ok, dry_run=False, rubric_fingerprint=None
       can be reached for is exactly how 47 rows came to be sitting in the
       New This Run view permanently.
 
-    scraped_ok comes from run_scrapers() and holds the names of the
+    scraped_ok comes from run_scrapers() and holds the page ids of the
     companies whose scrape actually completed this run.
 
     Why the diff exists
@@ -758,6 +842,9 @@ def sync_jobs_to_notion(jobs, scraped_ok, dry_run=False, rubric_fingerprint=None
     # outcome, not a double write.
     flag_cleared = set()
     carry_new_ids = set(carry_new_ids or ())
+    # Everything this run creates, plus whatever an earlier interrupted run
+    # already handed over, persisted as it goes (real runs only).
+    created_ids = set(carry_new_ids)
     if carry_new_ids:
         print(f"     [carry] keeping New This Run ticked on up to {len(carry_new_ids)} "
               f"row(s) created by an interrupted earlier run")
@@ -780,7 +867,10 @@ def sync_jobs_to_notion(jobs, scraped_ok, dry_run=False, rubric_fingerprint=None
             continue
         seen_urls_this_run.add(url)
 
-        company_page_id = company_page_by_name.get(job.get("company"))
+        # The job's own page id (stamped by prepare_jobs) beats a lookup by
+        # name: two Companies rows can share a name. The name lookup is only
+        # the fallback for a job that carries no id.
+        company_page_id = job.get("company_page_id") or company_page_by_name.get(job.get("company"))
         row = existing_by_url.get(url)
         # Notion's own, authoritative answer to "is this new" — this is what
         # "New This Run" is based on, instead of the separate local
@@ -790,6 +880,11 @@ def sync_jobs_to_notion(jobs, scraped_ok, dry_run=False, rubric_fingerprint=None
         # exactly what caused the checkbox count to not match the actual
         # created-row count. Notion's own state can't drift from itself.
         is_new_in_notion = row is None
+        # Notion's answer is the authority (invariant 9). Write it onto the
+        # job so jobs.json and the Excel "New This Run" tab - built from
+        # job["is_new"] - agree with the Notion view instead of with the
+        # separate seen_jobs.json record. Same list object as main()'s.
+        job["is_new"] = is_new_in_notion
 
         try:
             if is_new_in_notion:
@@ -808,8 +903,17 @@ def sync_jobs_to_notion(jobs, scraped_ok, dry_run=False, rubric_fingerprint=None
                 icon_url = company_icon_by_page_id.get(company_page_id)
                 if dry_run:
                     _log_planned_write("(create)", properties, f"URL not yet in Notion: {url}")
-                _create_job_posting(properties, icon_url=icon_url, dry_run=dry_run)
+                page = _create_job_posting(properties, icon_url=icon_url, dry_run=dry_run)
                 created += 1
+                if not dry_run and page and page.get("id"):
+                    created_ids.add(page["id"])
+                    try:
+                        _write_carry_file(created_ids)
+                    except OSError as e:
+                        # Losing the hand-off file costs a missed "new" flag
+                        # after an interruption, never a row; do not fail the
+                        # create over it.
+                        print(f"     [carry] could not record created row: {e}")
             else:
                 changed = _changed_job_properties(job, row, company_page_id)
                 if row["page_id"] in carry_new_ids:
@@ -872,7 +976,9 @@ def sync_jobs_to_notion(jobs, scraped_ok, dry_run=False, rubric_fingerprint=None
             # problem (an orphaned row) rather than a transient network
             # one, and so wants a human rather than just another run.
             left_open_unresolved.append(row)
-        elif company in scraped_ok:
+        elif row.get("company_page_id") in scraped_ok:
+            # Keyed by page id, not name: a same-named twin that scraped OK
+            # with zero jobs must not vouch for this row's company.
             to_close.append(row)
         else:
             left_open_failed.append(row)
@@ -1005,6 +1111,10 @@ def sync_jobs_to_notion(jobs, scraped_ok, dry_run=False, rubric_fingerprint=None
     # last_run would make the next real run stamp closing postings with the
     # date of a run that never happened.
     state.save(rubric_fingerprint, counts=counts, dry_run=dry_run)
+
+    # The sync ran to the end, so nothing is left for a next run to carry.
+    if not dry_run and os.path.exists(CARRY_NEW_PATH):
+        os.remove(CARRY_NEW_PATH)
 
     return {"created": created, "updated": updated, "unchanged": unchanged,
             "closed": closed, "unflagged": unflagged, "repeats": repeats,
@@ -1324,7 +1434,9 @@ def _create_job_posting(properties, icon_url=None, dry_run=False):
                "properties": _build_job_properties(properties)}
     if icon_url:
         payload["icon"] = {"type": "external", "external": {"url": icon_url}}
-    resp = session.post(url, headers=HEADERS, json=payload, timeout=NOTION_TIMEOUT)
+    # create_session, not the shared one: a create must not be re-sent after a
+    # 502/504 or a read timeout, or one posting can end up as two rows.
+    resp = create_session.post(url, headers=HEADERS, json=payload, timeout=NOTION_TIMEOUT)
     _raise_with_detail(resp)
     time.sleep(0.35)  # stay under Notion's ~3 req/s limit instead of retrying 429s after the fact
     return resp.json()

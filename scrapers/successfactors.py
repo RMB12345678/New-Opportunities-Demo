@@ -112,4 +112,9 @@ def fetch_jobs(company_name, careers_url, search_terms=None):
             polite_sleep()
             if not rows or startrow >= total:
                 break
+        else:
+            raise ScrapeShapeError(
+                f"{company_name}: SuccessFactors board still had postings after "
+                f"{MAX_PAGES} pages for query {term!r}; refusing to treat a truncated "
+                f"read as the whole board")
     return dedupe_by_url(jobs)

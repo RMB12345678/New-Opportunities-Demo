@@ -130,10 +130,10 @@ def test_a_failed_search_raises_instead_of_returning_a_blank():
 
 def test_missing_website_filter_needs_both_no_website_and_no_icon():
     rows = [
-        {"website": None, "has_icon": False},   # never processed -> missing
-        {"website": "https://acme.com", "has_icon": False},  # has a value -> not missing
-        {"website": None, "has_icon": True},     # already stamped (blank or real) -> not missing
-        {"website": "https://x.com", "has_icon": True},      # fully done -> not missing
+        {"company": "A", "website": None, "has_icon": False},   # never processed -> missing
+        {"company": "B", "website": "https://acme.com", "has_icon": False},  # has a value -> not missing
+        {"company": "C", "website": None, "has_icon": True},     # already stamped (blank or real) -> not missing
+        {"company": "D", "website": "https://x.com", "has_icon": True},      # fully done -> not missing
     ]
     original = nc.get_all_companies
     nc.get_all_companies = lambda: rows

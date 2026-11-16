@@ -108,7 +108,7 @@ def test_successful_scrape_closes_missing_row():
         [row("j1", "http://acme/1", "pg-acme"),
          row("j2", "http://acme/2", "pg-acme")] + pad,
         [{"url": "http://acme/1"}] + padjobs,
-        scraped_ok={ACME})
+        scraped_ok={"pg-acme"})
     assert res["closed"] == 1
     assert closed == ["j2"]
 
@@ -123,7 +123,7 @@ def test_failed_scrape_leaves_its_rows_open():
          row("j3", "http://beta/1", "pg-beta"),
          row("j4", "http://beta/2", "pg-beta")] + pad,
         [{"url": "http://acme/1"}] + padjobs,
-        scraped_ok={ACME})
+        scraped_ok={"pg-acme"})
     assert closed == ["j2"], "only Acme's missing row may close"
     assert res["left_open"] == 2
     assert not res["close_aborted"]
@@ -153,7 +153,7 @@ def test_unresolved_company_relation_never_closes():
          row("j3", "http://ghost/1", None),
          row("j4", "http://ghost/2", "pg-deleted-company")] + pad,
         [{"url": "http://acme/1"}] + padjobs,
-        scraped_ok={ACME})
+        scraped_ok={"pg-acme"})
     assert closed == ["j2"]
     assert res["left_open_unresolved"] == 2
 
@@ -165,7 +165,7 @@ def test_zero_jobs_from_a_reachable_company_still_closes():
     res, closed = sync(
         [row("j1", "http://acme/1", "pg-acme")] + pad,
         padjobs,
-        scraped_ok={ACME, BETA})
+        scraped_ok={"pg-acme", "pg-beta"})
     assert res["closed"] == 1
     assert closed == ["j1"]
 
@@ -173,7 +173,7 @@ def test_zero_jobs_from_a_reachable_company_still_closes():
 def test_valve_aborts_whole_pass_above_the_floor():
     pad, padjobs = filler(8, "pg-beta")
     doomed = [row("d%d" % i, "http://acme/%d" % i, "pg-acme") for i in range(24)]
-    res, closed = sync(doomed + pad, padjobs, scraped_ok={ACME, BETA})
+    res, closed = sync(doomed + pad, padjobs, scraped_ok={"pg-acme", "pg-beta"})
     assert res["close_aborted"]
     assert res["closed"] == 0
     assert closed == [], "an aborted pass must close nothing at all, not a subset"
@@ -183,7 +183,7 @@ def test_valve_allows_exactly_the_limit():
     """The limit is *more than* 25%, so exactly 25% goes through."""
     pad, padjobs = filler(18, "pg-beta")
     doomed = [row("d%d" % i, "http://acme/%d" % i, "pg-acme") for i in range(6)]
-    res, _ = sync(doomed + pad, padjobs, scraped_ok={ACME, BETA})
+    res, _ = sync(doomed + pad, padjobs, scraped_ok={"pg-acme", "pg-beta"})
     assert not res["close_aborted"]
     assert res["closed"] == 6
 
@@ -194,7 +194,7 @@ def test_valve_floor_lets_small_databases_close():
     res, _ = sync(
         [row("j%d" % i, "http://acme/%d" % i, "pg-acme") for i in range(4)],
         [{"url": "http://acme/3"}],
-        scraped_ok={ACME})
+        scraped_ok={"pg-acme"})
     assert not res["close_aborted"]
     assert res["closed"] == 3
 
@@ -203,11 +203,11 @@ def test_valve_floor_boundary():
     """19 open rows is under the floor and closes; 20 is at the floor, so
     the ratio applies and aborts."""
     under = [row("d%d" % i, "http://acme/%d" % i, "pg-acme") for i in range(19)]
-    res, _ = sync(under, [], scraped_ok={ACME})
+    res, _ = sync(under, [], scraped_ok={"pg-acme"})
     assert not res["close_aborted"] and res["closed"] == 19
 
     at = [row("d%d" % i, "http://acme/%d" % i, "pg-acme") for i in range(20)]
-    res, _ = sync(at, [], scraped_ok={ACME})
+    res, _ = sync(at, [], scraped_ok={"pg-acme"})
     assert res["close_aborted"] and res["closed"] == 0
 
 
@@ -223,7 +223,7 @@ def test_dry_run_reports_without_writing():
          row("j2", "http://beta/1", "pg-beta", title="Protected Role"),
          row("j3", "http://ghost/1", None, title="Orphan Role")],
         [{"url": "http://acme/2"}],
-        scraped_ok={ACME}, dry_run=True)
+        scraped_ok={"pg-acme"}, dry_run=True)
     assert closed == [], "a dry run must not write"
     assert res["closed"] == 1, "but it must still report the would-close"
     assert res["left_open"] == 1

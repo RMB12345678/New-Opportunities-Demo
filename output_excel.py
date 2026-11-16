@@ -2,8 +2,11 @@
 Converts output/jobs.json and output/skipped_companies.json into a single,
 formatted Excel workbook: output/job_postings.xlsx
 
-Two tabs:
-  - "Job Postings": every job found, one row per posting
+Five tabs:
+  - "New This Run": postings Notion reports as created by this run
+  - "Scored List": routed Scored
+  - "Needs Review": routed Needs review
+  - "Non-fits": routed Non-fit
   - "Needs Manual Check": companies the scraper couldn't cover automatically
 """
 import json

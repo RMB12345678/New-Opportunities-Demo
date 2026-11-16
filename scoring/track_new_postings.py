@@ -31,8 +31,11 @@ def _load_seen():
 
 def _save_seen(seen):
     os.makedirs(os.path.dirname(SEEN_PATH), exist_ok=True)
-    with open(SEEN_PATH, "w") as f:
+    # Atomic for the same reason as score_jobs._save_cache().
+    tmp = SEEN_PATH + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(seen, f, indent=2)
+    os.replace(tmp, SEEN_PATH)
 
 
 def mark_new_postings(jobs, dry_run=False):

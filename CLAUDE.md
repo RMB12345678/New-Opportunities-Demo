@@ -8,7 +8,7 @@ differences are load-bearing:
 
 | File | How it differs | Why |
 |---|---|---|
-| `notion/client.py` | `os.environ["JOB_POSTINGS_DATABASE_ID"]`, no hardcoded fallback | the fallback upstream is a real Notion database id |
+| `notion/client.py` | the repo owner is not named in four comments | no personal names in a public repo (the Job Postings id has no fallback in either copy as of 2026-11-16) |
 | `ats_finder/find_ats.py` | extra "can be adapted to any industry" line in the research prompt | this copy is a template others can reuse |
 | `.env.example` | every id is `xxxx` | nothing real belongs in a public repo |
 | `scoring/rubric.md` | no owner name, worked-example criteria | it is a sample, not a live job search |
@@ -26,7 +26,7 @@ Guidance for Claude Code working in this repository.
 
 ## What this is
 
-A pipeline that tracks job postings across ~425 target companies (medtech, digital
+A pipeline that tracks job postings across 1,506 target companies (as of 2026-11-13) (medtech, digital
 health, healthcare-focused PE/VC), scores each posting against a personal fit
 rubric, and syncs the results into a Notion dashboard plus an Excel workbook.
 
@@ -111,7 +111,7 @@ real failure, so preserve them unless the task explicitly says otherwise.
    marker. This distinction is the entire retry-safety design.
 2. **Never close a row for a company that didn't scrape successfully.** Absence from
    this run's results is not proof a posting is gone; it is equally consistent with a
-   timeout. Only companies in `scraped_ok` may have rows closed, a row whose Company
+   timeout. Only companies in `scraped_ok` (a set of Companies **page ids**, since two rows can share a name) may have rows closed, a row whose Company
    relation doesn't resolve is never closed, and a run that would close more than 25%
    of open rows (once there are at least 20) aborts the whole close pass.
 3. **Never overwrite a non-empty Notion field during backfill.** Callers pass `None`
@@ -177,9 +177,12 @@ real failure, so preserve them unless the task explicitly says otherwise.
     posting is by definition the run that did not see it. No view sorts or filters on
     it — check that again before making it load-bearing.
 15. **`None` from the scorer means "no answer this run", not "clear the field".** A
-    job whose scoring failed comes back with `score` and `routing` of `None`; the diff
-    skips those rather than blanking a good value. Same convention as
-    `update_company_info()`.
+    job whose scoring failed comes back with `score` of `None` (and, from
+    `_failure_result()`, a placeholder routing "Needs review", a "Scoring failed"
+    reasoning and `ic_role_flag` False); `_changed_job_properties()` skips every
+    scorer-owned field — Score, Routing, Reasoning, Ambiguity Note, IC Role — when
+    the score is `None`, rather than blanking or downgrading a good row. Same
+    convention as `update_company_info()`.
 16. **A company's page icon, not just `Website`, marks it as checked.** `Website` is a
     URL-type property, so it can't hold a text "Not found" marker the way `ATS Platform`
     does — writing empty means "never checked" (invariant 8) for every field except this
@@ -336,8 +339,10 @@ real failure, so preserve them unless the task explicitly says otherwise.
     `http_client.third_party_session` (total=2, backoff_factor=1, header ignored)
     is what `find_embedded_board.py` and `scrapers/html_generic.py` use to fetch
     arbitrary company sites, and `notion/client.py` passes `NOTION_TIMEOUT` (30 s)
-    on every call. **The patient `session` in `http_client.py` still honours
-    `Retry-After`**, as do the API scrapers on it — see punch list #28. Any
+    on every call. **The patient `session` in `http_client.py` no longer honours
+    `Retry-After` either** (punch list #28): every session there has
+    `respect_retry_after_header=False`, so only our own bounded `backoff_factor`
+    decides how long a retry waits. Any
     call that touches a third-party site outside a `try` in `run_scrapers` is a way
     for one company to kill the run; `detect_embedded_board` is now wrapped, and
     the `[detect] <company>` line printed before it is what names the culprit
@@ -496,7 +501,9 @@ the close script, in that order.
   SuccessFactors"). "Oracle Taleo" is deliberately not an alias of Oracle Recruiting
   Cloud; no Taleo scraper exists.
 - **Shared rules** (`scrapers/common.py`): one query per term in
-  `SENIOR_SEARCH_TERMS` instead of paging a whole board, 0.5 s between requests, a
+  `SENIOR_SEARCH_TERMS` instead of paging a whole board (for a tiered company only;
+  an untiered Oracle/SuccessFactors company gets `ALL_POSTINGS_TERMS`, an empty
+  keyword, i.e. the whole board, and a board longer than `MAX_PAGES` raises), 0.5 s between requests, a
   normal User-Agent, dedupe by URL, `ScrapeShapeError` (invariant 25).
 - **Workday** (existing scraper): gains `search_terms=` (used for the tier) and a
   shape check. Job URLs keep the `/en-US/{site}` form, since a URL is a posting's
@@ -525,7 +532,7 @@ the close script, in that order.
 - Standard library and `requests` first. Current deps: `requests`, `python-dotenv`,
   `openpyxl`, `beautifulsoup4`, `pytest`. Ask before adding another.
 - **All HTTP goes through `http_client.py`.** One shared session with urllib3 retries
-  on 429 and 5xx only, respecting `Retry-After`. Never call `requests.get/post/patch`
+  on 429 and 5xx only, never sleeping on `Retry-After`. Never call `requests.get/post/patch`
   directly. `try_known_patterns()` uses the separate low-retry session on purpose:
   those are speculative slug guesses where failing fast is correct.
 - Print statements are the current logging. They are deliberately verbose and
